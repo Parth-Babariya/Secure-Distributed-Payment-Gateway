@@ -1,0 +1,71 @@
+syntax = "proto3";
+package bank;
+
+service Bank {
+  
+  rpc ProcessTransaction(TransactionRequest) returns (TransactionResponse);
+  rpc GetBalance(BalanceRequest) returns (BalanceResponse);
+  
+  // New 2PC methods aligned with payment gateway
+  rpc PrepareTransaction(PrepareRequest) returns (PrepareResponse);
+  rpc CommitTransaction(CommitRequest) returns (CommitResponse);
+  rpc AbortTransaction(AbortRequest) returns (AbortResponse);
+}
+
+message TransactionRequest {
+  string from_account = 1;
+  string to_account = 2;
+  double amount = 3;
+}
+
+message TransactionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message BalanceRequest {
+  string account_number = 1;
+}
+
+message BalanceResponse {
+  double balance = 1;
+}
+
+// New messages for 2PC aligned with payment gateway
+message PrepareRequest {
+  string transaction_id = 1;
+  string account_number = 2;
+  double amount = 3;
+  string operation = 4;  // "debit" or "credit"
+}
+
+message PrepareResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CommitRequest {
+  string transaction_id = 1;
+  string account_number = 2;
+  double amount = 3;
+  string operation = 4;  // "debit" or "credit"
+}
+
+message CommitResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message AbortRequest {
+  string transaction_id = 1;
+  string account_number = 2;
+  double amount = 3;
+  string operation = 4;  // "debit" or "credit"
+}
+
+
+
+message AbortResponse {
+  bool success = 1;
+  string message = 2;
+}

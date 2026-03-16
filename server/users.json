@@ -1,0 +1,30 @@
+{
+    "users": [
+      {
+        "username": "alice",
+        "password": "alice123",
+        "bank_name": "HDFC",
+        "account_number": "1001"
+      },
+      {
+        "username": "alice",
+        "password": "alice123",
+        "bank_name": "SBI",
+        "account_number": "3001"
+      },
+      {
+        "username": "bob",
+        "password": "bob123",
+        "bank_name": "ICICI",
+        "account_number": "2001"
+      },
+      {
+        "username": "jack",
+        "password": "jack123",
+        "bank_name": "ICICI",
+        "account_number": "2002"
+      }
+
+    ]
+  }
+  

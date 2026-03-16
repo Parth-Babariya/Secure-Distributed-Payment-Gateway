@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+service PaymentGateway {
+    rpc RegisterBank(RegisterBankRequest) returns (RegisterBankResponse);
+    rpc AuthenticateClient (AuthRequest) returns (AuthResponse);
+    rpc CheckBalance (BalanceRequest) returns (BalanceResponse);
+    rpc ProcessPayment (PaymentRequest) returns (PaymentResponse);
+    rpc ViewTransactionHistory (TransactionHistoryRequest) returns (TransactionHistoryResponse);
+    rpc LogoutClient (LogoutRequest) returns (LogoutResponse);
+}
+
+message RegisterBankRequest {
+    string bank_name = 1;
+    int32 bank_port = 2;
+}
+
+message RegisterBankResponse {
+    bool success=1;
+    string message = 2;
+}
+
+message AuthRequest {
+    string username = 1;
+    string password = 2;
+}
+
+message AuthResponse {
+  bool authenticated = 1;
+  string token = 2;
+  string message = 3;  // Add this field for detailed responses
+}
+
+// Balance Request & Response
+message BalanceRequest {
+    string bank_name = 1;  // New field to specify which bank's balance to check
+}
+message BalanceResponse {
+    double balance = 1;
+}
+
+message PaymentRequest {
+    string transaction_id = 1;
+    string sender_bank_name=2;
+    string receiver_username=3;
+    string receiver_bank_name = 4;  // ✅ Sender's bank name (required)
+    double amount = 5;
+}
+
+message PaymentResponse {
+    bool success = 1;
+    string message = 2;
+    string transaction_id = 3; // adding this field
+}
+
+message LogoutRequest {}
+
+message LogoutResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+
+message TransactionHistoryRequest {
+    // The request doesn't need parameters since the server extracts user info from metadata.
+}
+
+message Transaction {
+    string transaction_id = 1;
+    string from_bank = 2;
+    string to_bank = 3;
+    string from_account_no = 4;  // Will be included only for sender
+    string from_user_id = 5;      // Will be included only for receiver
+    string to_user_id = 6;        // Will be included only for sender
+    double amount = 7;
+    string timestamp = 8;
+    string status = 9;
+}
+
+message TransactionHistoryResponse {
+    repeated Transaction transactions = 1;
+}
