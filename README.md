@@ -6,6 +6,8 @@ A payment gateway that moves money between accounts at independent bank servers,
 
 The headline result: a chaos test sends payments continuously while hard-killing the gateway and banks at random. Afterwards it checks every payment against both banks' ledgers and confirms that each one either fully happened or did not happen at all, and that no money was created or lost.
 
+The full design report, with correctness arguments and evaluation, is [Report.pdf](Report.pdf) (LaTeX source in [report/](report/)).
+
 ## Architecture
 
 ```mermaid

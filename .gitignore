@@ -12,3 +12,6 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+# LaTeX build output (the compiled PDF is copied to the repo root)
+report/*
+!report/Report.tex
