@@ -22,7 +22,7 @@ import grpc  # noqa: E402
 import config  # noqa: E402  (also puts protofiles/ on sys.path)
 import payment_gateway_pb2  # noqa: E402
 import payment_gateway_pb2_grpc  # noqa: E402
-from tls import secure_channel  # noqa: E402
+from tls import gateway_channel  # noqa: E402
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2
@@ -52,7 +52,7 @@ def parse_amount(text):
 
 class GatewayClient:
     def __init__(self, address=config.GATEWAY_ADDRESS, cert_dir=config.CERT_DIR):
-        self.channel = secure_channel(address, cert_dir, config.CLIENT_CN)
+        self.channel = gateway_channel(address, cert_dir, config.CLIENT_CN)
         self.stub = payment_gateway_pb2_grpc.PaymentGatewayStub(self.channel)
         self.token = None
         self.queue_lock = threading.Lock()

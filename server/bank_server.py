@@ -23,7 +23,7 @@ import payment_gateway_pb2
 import payment_gateway_pb2_grpc
 from interceptor import LoggingInterceptor, PeerIdentityInterceptor
 from storage import SQLiteStore
-from tls import secure_channel, server_credentials
+from tls import gateway_channel, server_credentials
 
 log = logging.getLogger("bank")
 
@@ -229,7 +229,7 @@ class BankService(bank_pb2_grpc.BankServicer):
 def register_with_gateway(bank_name, host, port, gateway_address, cert_dir, stop_event,
                           retry_delay=2.0):
     """Register this bank with the gateway, retrying until it succeeds."""
-    channel = secure_channel(gateway_address, cert_dir, bank_name.lower())
+    channel = gateway_channel(gateway_address, cert_dir, bank_name.lower())
     stub = payment_gateway_pb2_grpc.PaymentGatewayStub(channel)
     request = payment_gateway_pb2.RegisterBankRequest(bank_name=bank_name, bank_port=port, bank_host=host)
     try:

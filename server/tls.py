@@ -41,6 +41,22 @@ def secure_channel(target, cert_dir, name):
     return grpc.secure_channel(target, channel_credentials(cert_dir, name), options=CHANNEL_OPTIONS)
 
 
+def gateway_channel(address, cert_dir, name):
+    """Channel to the gateway. `address` may list several gateways as
+    comma-separated IP:port pairs; calls are then spread round-robin over
+    the ones that are up, so a gateway crash only fails the calls in flight
+    on it."""
+    addresses = [a.strip() for a in address.split(",") if a.strip()]
+    if len(addresses) == 1:
+        return secure_channel(addresses[0], cert_dir, name)
+    options = CHANNEL_OPTIONS + [
+        ("grpc.lb_policy_name", "round_robin"),
+        # Every gateway presents the same "gateway" certificate.
+        ("grpc.ssl_target_name_override", "gateway"),
+    ]
+    return grpc.secure_channel("ipv4:" + ",".join(addresses), channel_credentials(cert_dir, name), options=options)
+
+
 def peer_host(context):
     """Caller's address without the port, e.g. '10.0.0.5' or '::1'."""
     kind, _, rest = context.peer().partition(":")
