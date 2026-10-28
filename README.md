@@ -1,165 +1,186 @@
-# 🏦 Secure Distributed Payment Gateway
+# Secure Distributed Payment Gateway
 
-This project implements a **secure and distributed** payment gateway system using **gRPC**. It supports multiple **bank servers**, **clients**, **secure transactions**, and **two-phase commit (2PC)** for **atomic transactions**.
+[![CI](https://github.com/Parth-Babariya/Secure-Distributed-Payment-Gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Parth-Babariya/Secure-Distributed-Payment-Gateway/actions/workflows/ci.yml)
 
-## 🚀 Features
+A payment gateway that moves money between accounts at independent bank servers, built with Python and gRPC. Each transfer is **atomic across banks** using two-phase commit (2PC) with durable logs and automatic crash recovery. Every connection uses mutual TLS, and users authenticate with revocable JWT sessions.
 
-### ✅ **Authentication & Authorization**
-- Clients authenticate using **JWT tokens**.
-- Role-based access control enforced via **gRPC Interceptors**.
-- Secure **SSL/TLS encryption** for all communication.
+The headline result: a chaos test sends payments continuously while hard-killing the gateway and banks at random. Afterwards it checks every payment against both banks' ledgers and confirms that each one either fully happened or did not happen at all, and that no money was created or lost.
 
-### ✅ **Bank Registration**
-- **Dynamic Bank Registration**: Banks **self-register** with the Payment Gateway at startup.
-- Secure registration using **bank-specific certificates**.
+## Architecture
 
-### ✅ **Transactions**
-- **Process Payments** securely via **Two-Phase Commit (2PC)**.
-- **Idempotent Transactions** prevent duplicate payments.
-- **Transaction History** is stored and accessible to users.
+```mermaid
+flowchart LR
+    C[Client CLI<br/>offline queue] -- "mTLS + JWT" --> G
+    subgraph G[Payment Gateway — 2PC coordinator]
+        A[Auth: scrypt passwords,<br/>JWT, login throttling]
+        P[Coordinator]
+        R[Recovery worker]
+        L[(gateway.db<br/>coordinator log)]
+        P --> L
+        R --> L
+    end
+    P -- "mTLS (gateway cert only)" --> H[HDFC bank]
+    P -- "mTLS" --> I[ICICI bank]
+    P -- "mTLS" --> S[SBI bank]
+    H --> HL[(hdfc.db<br/>ledger)]
+    I --> IL[(icici.db)]
+    S --> SL[(sbi.db)]
+    H -. "RegisterBank<br/>(cert CN must match)" .-> G
+```
 
-### ✅ **Offline Payments & Retry Mechanism**
-- **Offline Mode**: If the Payment Gateway is down, transactions are **queued** and retried when online.
-- **Automatic Retries** for failed transactions.
+| Component | File | Role |
+|---|---|---|
+| Payment gateway | [server/payment_gateway.py](server/payment_gateway.py) | Authenticates users, validates payments, coordinates 2PC, recovers in-doubt transactions |
+| Bank server | [server/bank_server.py](server/bank_server.py) | 2PC participant; durable SQLite ledger with fund reservations |
+| Client | [client/client.py](client/client.py) | Interactive CLI; queues payments on disk while the gateway is unreachable |
+| Interceptors | [server/interceptor.py](server/interceptor.py) | JWT authorization, certificate-identity checks, access logging with status and latency |
+| Certificates | [scripts/gen_certs.py](scripts/gen_certs.py) | Generates a local CA and one certificate per component (never committed) |
 
-### ✅ **Logging & Monitoring**
-- **All requests and responses** are logged.
-- Failed transactions are **recorded in transactions.json**.
-- Logging is handled via **gRPC Interceptors**.
+## How a payment works
 
----
+```
+PREPARING --both banks vote yes--> COMMITTING --both acknowledge--> COMMITTED
+    |
+    +--a "no" vote, bank unreachable, or prepare timeout--> ABORTING --both acknowledge--> ABORTED
+```
 
-## **1️⃣ Assumptions**
-1. **Predefined Users**  
-   - The system **does not allow new user registrations**.  
-   - A predefined list of users is stored in `users.json`.  
-   - Users must authenticate using their registered username and password. 
-2. **Single Account per Bank**  
-   - A user **cannot have multiple accounts in the same bank**.  
-   - However, a user **can have accounts in different banks**. 
-3. **Bank Registration Requires Certificates**  
-   - Before a bank can register with the Payment Gateway,  
-     it **must have its SSL key and certificate** (`{bank_name}.key` and `{bank_name}.crt`).  
-   - If these files are missing, the bank **cannot establish a secure connection**.  
+1. **Validate.** The gateway checks the JWT, that the amount is positive and within limits, and that the sender owns the source account and the receiver account exists. Amounts are integer **paise**, never floats.
+2. **Log.** The payment is inserted as `PREPARING`. The client-generated transaction id is the primary key, so a retry with the same id returns the stored outcome instead of charging twice.
+3. **Phase 1 (prepare).** The sender's bank *reserves* the funds, which reduces the available balance; the receiver's bank checks that the account exists. Each bank writes its vote to its own SQLite ledger before replying, so a bank that crashes after voting yes still honours the decision when it restarts.
+4. **Decision.** The gateway durably records `COMMITTING` (or `ABORTING`) *before* telling any bank, using a compare-and-set on the status.
+5. **Phase 2.** Commit and abort are idempotent at the banks, so the gateway can retry them safely. An abort for a transaction a bank never saw leaves a tombstone, so a delayed prepare arriving later is refused.
+6. **Recovery.** A background worker, which also runs right after a restart, retries phase 2 for every `COMMITTING`/`ABORTING` payment until both banks acknowledge. A payment stuck in `PREPARING` past a timeout is aborted (*presumed abort*), because no commit decision was ever logged.
 
-4. **Client & Bank Servers Know Payment Gateway Address**  
-   - The Payment Gateway runs on a **fixed, known address** (`localhost:50052`).  
-   - Clients and bank servers must **already know this address** to communicate securely.   
-5. **Dynamic Bank Registration** – Banks **register automatically** with the Payment Gateway when started.  
-6. **Client-Generated Transaction IDs** – Ensures **idempotency** and prevents duplicate payments.  
-7. **SSL/TLS Security** – All communication is **secure** between clients, banks, and the payment gateway.  
-8. **System Always Logs Transactions** – All transactions (success & failure) are stored in `transactions.json`.  
+**Why double spending is impossible.** A bank's funds check and its reservation run in one serialised SQLite transaction (`BEGIN IMMEDIATE`). Two concurrent payments therefore cannot both pass the check. The test suite fires 40 concurrent ₹100 payments at a ₹1,500 balance and asserts exactly 15 succeed.
 
+## Security model
 
----
+| Threat | Mitigation |
+|---|---|
+| Eavesdropping or tampering | mTLS on every hop; the CA signs a separate certificate for each component |
+| Leaked keys in the repository | No keys are committed. `scripts/gen_certs.py` creates them locally, in Docker, and in tests |
+| Calling a bank directly to mint or move money | Banks accept calls only from the certificate with CN `gateway` |
+| Impersonating a bank to divert its traffic | `RegisterBank` requires the caller's certificate CN to be `<bank>.bank` |
+| Negative or oversized amounts | Validated on the server; the banks also reject amounts ≤ 0 |
+| Stolen password database | Passwords are stored as salted scrypt hashes and compared in constant time; logins for unknown users take the same time |
+| Password guessing | 5 failures within 5 minutes lock the username for 60 s |
+| Token theft after logout | Each JWT has a `jti` that logout revokes; the revocation list is persisted, so it survives restarts |
+| Weak or hard-coded JWT secret | Read from `PG_JWT_SECRET`, at least 32 characters; a random per-process secret is used if it is unset |
+| Reusing another user's transaction id | Idempotency is bound to the user and the payment parameters; a mismatch returns `ALREADY_EXISTS` |
 
-## **2️⃣ Installation & Setup**
-### **📌 Prerequisites**
-- Python 3.10+
-- gRPC & Protocol Buffers (`protobuf`, `grpcio`, `grpcio-tools`)
-- OpenSSL (for SSL/TLS certificates)
+## Quick start
 
-### **📌 Install Dependencies**
+### Docker (recommended)
+
 ```sh
-pip install grpcio grpcio-tools protobuf PyJWT
+docker compose up --build -d      # generates certs, starts gateway + HDFC, ICICI, SBI
+docker compose run --rm client    # interactive client
+docker compose down -v            # stop and delete state
+```
 
-📌 Generate gRPC Code from Protobuf
+### Local
 
-python -m grpc_tools.protoc -I=protos --python_out=. --grpc_python_out=. protos/payment_gateway.proto
-python -m grpc_tools.protoc -I=protos --python_out=. --grpc_python_out=. protos/bank.proto
+```sh
+python -m venv .venv && .venv/Scripts/activate      # or: source .venv/bin/activate
+pip install -r requirements-dev.txt
+python scripts/gen_certs.py
 
----
+cd server
+python payment_gateway.py          # terminal 1
+python bank_server.py HDFC 60051   # terminal 2
+python bank_server.py ICICI 60052  # terminal 3
+python bank_server.py SBI 60053    # terminal 4
+python ../client/client.py         # terminal 5
+```
 
+Demo users (passwords are stored hashed in [server/users.json](server/users.json); add users with `scripts/hash_password.py`):
 
-3️⃣ Running the System
-1. Start the Payment Gateway
+| User | Password | Accounts |
+|---|---|---|
+| alice | alice123 | HDFC 1001, SBI 3001 |
+| bob | bob123 | ICICI 2001 |
+| jack | jack123 | ICICI 2002 |
+| carol | carol123 | HDFC 1002 |
 
-python payment_gateway.py
+Opening balances come from [server/bank_data.json](server/bank_data.json) the first time each bank starts. After that, each bank's ledger in `data/<bank>.db` is the source of truth.
 
-2. Start Bank Servers (Example: HDFC, ICICI, SBI)
+<details>
+<summary>Configuration (environment variables)</summary>
 
-python bank_server.py HDFC 60051
-python bank_server.py ICICI 60052
-python bank_server.py SBI 60053
+| Variable | Default | Meaning |
+|---|---|---|
+| `PG_JWT_SECRET` | random per process | HS256 signing key (≥ 32 chars) |
+| `PG_CERT_DIR` / `PG_DATA_DIR` | `certs/` / `data/` | Certificate and database locations |
+| `PG_GATEWAY_ADDRESS` | `localhost:50052` | Where banks and clients find the gateway |
+| `PG_BANK_HOST` | `localhost` | Host name a bank registers itself under |
+| `PG_PREPARE_TIMEOUT` | `30` | Seconds before an undecided payment is presumed aborted |
+| `PG_BANK_RPC_TIMEOUT` | `3` | Deadline for each gateway → bank call |
+| `PG_SQLITE_SYNC` | `FULL` | `FULL` fsyncs every commit; `NORMAL` survives process crashes but not OS crashes |
+</details>
 
-3. Run the Client
+## Testing
 
-python client.py
+```sh
+pytest -q                                   # 33 tests, ~25 s
+python scripts/chaos_demo.py --seconds 60   # kill processes mid-payment, then audit
+python scripts/benchmark.py                 # throughput and latency
+```
 
----
+The [tests](tests/) start a gateway and three banks in-process on free ports and cover:
 
-4️⃣ Usage
-Authenticate a User
-> Enter Username: alice
-> Enter Password: alice123
-✅ Login successful! Token: eyJhbGciOi...
+- **Payments.** Cross-bank transfers, insufficient funds, server-side amount validation, a specific status code for each error, idempotent retries, a concurrent double-spend attempt, and 120 random concurrent transfers that must conserve money.
+- **Security.** Missing, forged, expired and revoked tokens; revocation surviving a restart; login lockout; reading another user's account; bank impersonation; non-gateway callers hitting a bank.
+- **Recovery (fault injection).**
+  - A receiver bank's commit fails, then the retry succeeds.
+  - A bank is down during prepare.
+  - The gateway crashes after the commit decision.
+  - The gateway crashes before any decision (presumed abort).
+  - A bank crashes after voting yes.
+  - A late prepare arrives after the abort.
+- **Client.** Rupee parsing; an offline payment queued to disk and sent exactly once after the gateway returns.
 
-Check Balance
+CI runs the suite, the chaos demo, a check that the generated protobuf code is up to date, and a Docker Compose smoke test.
 
-> Select an option: 3
-Enter your bank name: HDFC  
-💰 Your Balance: ₹5000.00  
+### Chaos demo
 
+`scripts/chaos_demo.py` runs the gateway and banks as separate OS processes. Eight client threads send random payments while a random component is **hard-killed** (`SIGKILL`/`TerminateProcess`) and restarted every 1–3 s. After the load stops and recovery settles, it audits the gateway log against every bank ledger. A 40 s run on a laptop:
 
-Process a Payment
+```
+Kills:            {'GATEWAY': 4, 'SBI': 4, 'HDFC': 5, 'ICICI': 2} (15 total)
+Client outcomes:  {'COMMITTED': 2241, 'ABORTED': 470, 'rpc:UNAVAILABLE': 32, 'COMMITTING': 7, 'ABORTING': 1}
+Logged payments:  2747 -> {'ABORTED': 483, 'COMMITTED': 2264}
+Money:            opening 2300000 paise, closing 2300000 paise
+PASSED: every payment is atomic, nothing in doubt, money conserved
+```
 
-> Select an option: 2
-Enter your bank name: ICICI  
-Enter recipient's username: bob  
-Enter recipient's bank name: HDFC  
-Enter amount: 1000  
-📌 Payment Status: Transaction successfully completed
+The recovery worker settled 158 payments that were in doubt when a process died: 117 committed and 41 aborted. Ten of those 41 had been left in `PREPARING` by a gateway crash and were presumed aborted.
 
-View Transaction History
+### Benchmark
 
- > Select an option: 4
-📜 Transaction History:
+End-to-end payments (gateway and three banks as separate processes, mTLS on every hop, Windows laptop, 8 s per level):
 
-1️⃣ [TXN: txn_1710612345] Sent ₹1000.00 to bob (ICICI) ✅ Success - 2025-03-16 14:30:45
-2️⃣ [TXN: txn_1710615678] Received ₹2000.00 from charlie (HDFC) ✅ Success - 2025-03-16 15:10:30
-3️⃣ [TXN: txn_1710617890] Sent ₹500.00 to dave (SBI) ❌ Failed - Insufficient Funds - 2025-03-16 16:00:10
-4️⃣ [TXN: txn_1710619000] Received ₹1500.00 from eve (SBI) ✅ Success - 2025-03-16 17:20:05
-  
+| Concurrent clients | TPS (`FULL` fsync) | p50 / p99 ms | TPS (`NORMAL`) | p50 / p99 ms |
+|---:|---:|---:|---:|---:|
+| 1 | 57 | 16 / 29 | 118 | 8 / 21 |
+| 4 | 77 | 42 / 328 | 187 | 20 / 40 |
+| 16 | 49 | 319 / 489 | 208 | 72 / 134 |
+| 32 | 67 | 391 / 713 | 226 | 134 / 221 |
 
-Logout
+Each payment makes three durable writes at the gateway and two at each bank. With `FULL` durability, fsync is the bottleneck: relaxing it to `NORMAL` gives about 4× the throughput. The next step would be group commit, batching the log writes of many concurrent payments into one fsync.
 
-> Select an option: 5
-✅ Logout successful!
+## Limitations and next steps
 
----
+- **The coordinator is a single point of failure.** 2PC is a blocking protocol: while the gateway is down, prepared reservations stay held until it recovers, which is safe but not available. Running the coordinator log on a replicated store (Raft or Paxos) would remove this; it is what systems like Spanner do.
+- **One SQLite connection per process** serialises writes. A production system would use PostgreSQL and group commit.
+- **Users live in a JSON file**, and the JWT uses a single shared HS256 key. A real deployment would use a user database and asymmetric keys (RS256 or EdDSA) with rotation.
+- **Prepare runs sequentially** at the two banks; running both in parallel would cut latency.
 
-5️⃣ Error Handling & Retries
+## Repository layout
 
-    Automatic Retries if Payment Gateway is down.
-    Idempotent Payments prevent duplicate deductions.
-    2PC Aborts if any participant fails.
-
----    
-
-7️⃣ Security
-
-    JWT Tokens for authentication & authorization.
-    SSL/TLS Encryption between all components.
-    gRPC Interceptors for logging & access control.
----    
-
-8️⃣ File Structure
-    
-📂 certs/  
- ├── 📂 bank/        # SSL certificates for banks (HDFC, ICICI, SBI)  
- ├── 📂 client/      # Client certificates  
- ├── 📂 ca/          # Certificate Authority (CA) files  
-📂 client/  
- ├── client.py       # Client implementation  
- ├── offline_payments.json  # Stores queued payments  
-📂 profiles/  
- ├── bank_pb2.py, payment_gateway_pb2.py  # gRPC-generated files  
-📂 server/  
- ├── bank_server.py  # Bank server logic  
- ├── payment_gateway.py  # Payment Gateway server  
- ├── transactions.json  # Stores all transactions  
- ├── users.json  # Pre-configured users  
-
-      
-
----
+```
+protofiles/   gRPC service definitions (.proto) and generated code
+server/       payment_gateway.py, bank_server.py, auth.py, interceptor.py, storage.py, tls.py, config.py
+client/       client.py
+scripts/      gen_certs.py, hash_password.py, chaos_demo.py, benchmark.py, cluster.py
+tests/        pytest suite and in-process harness
+```
