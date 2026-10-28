@@ -22,6 +22,7 @@ from concurrent import futures
 import grpc
 
 import config
+import etcd_log
 import bank_pb2
 import bank_pb2_grpc
 import payment_gateway_pb2
@@ -113,13 +114,14 @@ class CoordinatorLog(SQLiteStore):
             (to_state, message, time.time(), txn_id, *from_states),
         ).rowcount == 1)
 
-    def in_doubt(self, prepare_timeout):
-        """Payments the recovery worker must drive forward."""
-        cutoff = time.time() - prepare_timeout
+    def in_doubt(self, prepare_timeout, grace=0.0):
+        """Payments the recovery worker must drive forward: decided ones not
+        touched for `grace` seconds, and undecided ones past the timeout."""
+        now = time.time()
         return self.query(
-            "SELECT * FROM payments WHERE status IN (?, ?) OR (status = ? AND updated_at < ?) "
-            "ORDER BY created_at",
-            (COMMITTING, ABORTING, PREPARING, cutoff),
+            "SELECT * FROM payments WHERE (status IN (?, ?) AND updated_at <= ?) "
+            "OR (status = ? AND updated_at < ?) ORDER BY created_at",
+            (COMMITTING, ABORTING, now - grace, PREPARING, now - prepare_timeout),
         )
 
     def history(self, username):
@@ -174,14 +176,27 @@ class BankDirectory:
     """Maps bank names to gRPC stubs, rebuilding a channel when a bank
     re-registers at a different address."""
 
-    def __init__(self, coordinator_log, cert_dir):
+    def __init__(self, coordinator_log, cert_dir, cache_seconds=2.0):
         self.log = coordinator_log
         self.cert_dir = cert_dir
+        self.cache_seconds = cache_seconds
         self._channels = {}  # name -> (address, channel, stub)
+        self._locations = {}  # name -> (looked up at, (host, port) or None)
         self._lock = threading.Lock()
 
-    def stub(self, bank_name):
+    def _location(self, bank_name):
+        """The bank's registered address, re-read at most every few seconds
+        (each lookup is a round trip when the log is in etcd)."""
+        now = time.monotonic()
+        cached = self._locations.get(bank_name)
+        if cached and cached[1] is not None and now - cached[0] < self.cache_seconds:
+            return cached[1]
         location = self.log.get_bank(bank_name)
+        self._locations[bank_name] = (now, location)
+        return location
+
+    def stub(self, bank_name):
+        location = self._location(bank_name)
         if location is None:
             raise BankUnavailable(f"Bank {bank_name} is not registered")
         address = f"{location[0]}:{location[1]}"
@@ -196,6 +211,11 @@ class BankDirectory:
             self._channels[bank_name] = (address, channel, stub)
             return stub
 
+    def forget(self, bank_name):
+        """Drop the cached address after a failed call: the bank may have
+        restarted elsewhere."""
+        self._locations.pop(bank_name, None)
+
     def close(self):
         with self._lock:
             for _, channel, _ in self._channels.values():
@@ -207,8 +227,11 @@ class Coordinator:
     """Runs the two-phase commit protocol over the participant banks."""
 
     def __init__(self, coordinator_log, banks, rpc_timeout=config.BANK_RPC_TIMEOUT_SECONDS,
-                 prepare_timeout=config.PREPARE_TIMEOUT_SECONDS):
+                 prepare_timeout=config.PREPARE_TIMEOUT_SECONDS, recovery_grace=0.0):
         self.log = coordinator_log
+        # With several gateways sharing one log, a decided payment is left to
+        # the gateway running it for this long before recovery joins in.
+        self.recovery_grace = recovery_grace
         self.banks = banks
         self.rpc_timeout = rpc_timeout
         self.prepare_timeout = prepare_timeout
@@ -234,6 +257,7 @@ class Coordinator:
             )
             return response.vote_commit, response.message
         except (grpc.RpcError, BankUnavailable) as e:
+            self.banks.forget(bank)
             detail = e.details() if isinstance(e, grpc.RpcError) else str(e)
             return False, f"{bank} unavailable during prepare: {detail}"
 
@@ -254,6 +278,7 @@ class Coordinator:
                               "commit" if commit else "abort", response.message)
                     all_acked = False
             except (grpc.RpcError, BankUnavailable) as e:
+                self.banks.forget(bank)
                 detail = e.code().name if isinstance(e, grpc.RpcError) else str(e)
                 log.warning("[%s] %s not reached for %s (%s); will retry", txn_id, bank,
                             "commit" if commit else "abort", detail)
@@ -292,7 +317,7 @@ class Coordinator:
 
     def recover_once(self):
         """Drive every in-doubt transaction one step forward."""
-        for row in self.log.in_doubt(self.prepare_timeout):
+        for row in self.log.in_doubt(self.prepare_timeout, self.recovery_grace):
             txn_id = row["transaction_id"]
             if row["status"] == PREPARING:
                 # Presumed abort: the coordinator never logged a decision.
@@ -506,15 +531,29 @@ class Gateway:
 def build_gateway(port=config.GATEWAY_PORT, *, cert_dir=None, data_dir=None, users=None,
                   jwt_key_dir=None, prepare_timeout=config.PREPARE_TIMEOUT_SECONDS,
                   recovery_interval=config.RECOVERY_INTERVAL_SECONDS,
-                  rpc_timeout=config.BANK_RPC_TIMEOUT_SECONDS, bind_host="[::]"):
-    """Create a Gateway (not yet started)."""
+                  rpc_timeout=config.BANK_RPC_TIMEOUT_SECONDS, bind_host="[::]",
+                  etcd_endpoints=None, etcd_prefix=config.ETCD_PREFIX):
+    """Create a Gateway (not yet started).
+
+    With etcd endpoints (argument or PG_ETCD_ENDPOINTS) the coordinator log
+    is the shared, replicated etcd store and any number of gateways can run
+    against it; otherwise it is data_dir/gateway.db.
+    """
     cert_dir = cert_dir or config.CERT_DIR
     data_dir = data_dir or config.DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    coordinator_log = CoordinatorLog(data_dir / "gateway.db")
+    etcd_endpoints = etcd_endpoints or config.ETCD_ENDPOINTS
+    if etcd_endpoints:
+        coordinator_log = etcd_log.connect(etcd_endpoints, config.ETCD_CERT_DIR or cert_dir / "etcd", etcd_prefix)
+        recovery_grace = rpc_timeout
+        log.info("Coordinator log: etcd at %s", ", ".join(etcd_endpoints))
+    else:
+        coordinator_log = CoordinatorLog(data_dir / "gateway.db")
+        recovery_grace = 0.0
     banks = BankDirectory(coordinator_log, cert_dir)
-    coordinator = Coordinator(coordinator_log, banks, rpc_timeout=rpc_timeout, prepare_timeout=prepare_timeout)
+    coordinator = Coordinator(coordinator_log, banks, rpc_timeout=rpc_timeout, prepare_timeout=prepare_timeout,
+                              recovery_grace=recovery_grace)
     tokens = TokenManager(coordinator_log, KeyRing(jwt_key_dir or config.JWT_KEY_DIR or cert_dir / "jwt"))
     service = PaymentGatewayService(users if users is not None else load_users(), coordinator_log, banks,
                                     coordinator, tokens, LoginThrottle(coordinator_log))

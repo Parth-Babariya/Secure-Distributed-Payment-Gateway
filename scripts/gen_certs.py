@@ -49,13 +49,13 @@ def _cert_bytes(cert):
     return cert.public_bytes(serialization.Encoding.PEM)
 
 
-def make_ca():
+def make_ca(name="Payment Gateway Demo CA"):
     key = ec.generate_private_key(ec.SECP256R1())
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
-        .subject_name(_name("Payment Gateway Demo CA"))
-        .issuer_name(_name("Payment Gateway Demo CA"))
+        .subject_name(_name(name))
+        .issuer_name(_name(name))
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(minutes=5))
@@ -98,6 +98,28 @@ def make_leaf(ca_key, ca_cert, common_name, dns_names):
     return key, cert
 
 
+def generate_etcd(out_dir, force=False):
+    """Credentials for the replicated coordinator store (etcd), in <out>/etcd/.
+
+    etcd gets its own CA, so only holders of a certificate from it, i.e. the
+    gateways, can reach the store; a bank or client certificate from the main
+    CA is refused. etcd.crt serves clients and peers; gateway.crt is the
+    gateways' client certificate.
+    """
+    target = Path(out_dir) / "etcd"
+    if (target / "ca.crt").exists() and not force:
+        return
+    target.mkdir(parents=True, exist_ok=True)
+    ca_key, ca_cert = make_ca("Coordinator Store CA")
+    _write(target / "ca.key", _key_bytes(ca_key))
+    _write(target / "ca.crt", _cert_bytes(ca_cert))
+    for name in ("etcd", "gateway"):
+        key, cert = make_leaf(ca_key, ca_cert, name, ["localhost", name])
+        _write(target / f"{name}.key", _key_bytes(key))
+        _write(target / f"{name}.crt", _cert_bytes(cert))
+    print(f"Wrote coordinator-store (etcd) CA and certificates to {target}")
+
+
 def ensure_jwt_key(directory):
     """Create a token signing key unless the directory already has one."""
     if not any(state == "signing" for _, state in jwt_keys.list_keys(directory)):
@@ -114,6 +136,8 @@ def generate(out_dir, banks=DEFAULT_BANKS, force=False, split=False):
     """
     out_dir = Path(out_dir)
     ensure_jwt_key(out_dir / "jwt")
+    if not split:
+        generate_etcd(out_dir, force)
     ca_dir = out_dir / "ca" if split else out_dir
     ca_dir.mkdir(parents=True, exist_ok=True)
     if (ca_dir / "ca.crt").exists() and not force:

@@ -15,3 +15,6 @@ __pycache__/
 # LaTeX build output (the compiled PDF is copied to the repo root)
 report/*
 !report/Report.tex
+
+# Downloaded tools (scripts/get_etcd.py)
+.tools/

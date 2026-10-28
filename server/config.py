@@ -42,6 +42,14 @@ MAX_CLIENT_LOGIN_FAILURES = 20
 LOGIN_FAILURE_WINDOW_SECONDS = 300
 LOGIN_LOCKOUT_SECONDS = 60
 
+# Where the coordinator log lives. Unset: a local SQLite file (one gateway).
+# A comma-separated list of etcd endpoints, e.g. "127.0.0.1:2379,...": a
+# Raft-replicated store shared by any number of gateways (see etcd_log.py).
+ETCD_ENDPOINTS = [e.strip() for e in os.environ.get("PG_ETCD_ENDPOINTS", "").split(",") if e.strip()]
+# CA and client certificate for etcd; defaults to <cert dir>/etcd.
+ETCD_CERT_DIR = Path(os.environ["PG_ETCD_CERT_DIR"]) if os.environ.get("PG_ETCD_CERT_DIR") else None
+ETCD_PREFIX = os.environ.get("PG_ETCD_PREFIX", "/pg/")
+
 # Largest single payment accepted (Rs 10,00,000).
 MAX_PAYMENT_PAISE = 100_000_000
 
