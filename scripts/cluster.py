@@ -26,7 +26,7 @@ IN_DOUBT = ("PREPARING", "COMMITTING", "ABORTING")
 
 
 class Cluster:
-    def __init__(self, work_dir, seed, prepare_timeout=3.0, recovery_interval=0.5):
+    def __init__(self, work_dir, seed, prepare_timeout=3.0, recovery_interval=0.5, extra_env=None):
         self.work_dir = Path(work_dir)
         self.cert_dir = self.work_dir / "certs"
         self.data_dir = self.work_dir / "data"
@@ -47,6 +47,7 @@ class Cluster:
             "PG_PREPARE_TIMEOUT": str(prepare_timeout),
             "PG_RECOVERY_INTERVAL": str(recovery_interval),
             "PYTHONUNBUFFERED": "1",
+            **(extra_env or {}),
         }
         self.processes = {}
 
