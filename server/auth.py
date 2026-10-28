@@ -4,7 +4,6 @@ import hmac
 import json
 import logging
 import secrets
-import threading
 import time
 import uuid
 
@@ -52,36 +51,54 @@ def load_users(path=None):
 
 
 class LoginThrottle:
-    """Locks a username out for a while after repeated failed logins."""
+    """Rate-limits failed logins, persisted in the gateway's database.
 
-    def __init__(self, max_failures=config.MAX_LOGIN_FAILURES,
+    Two counters apply to each attempt:
+      * (username, client address): an attacker guessing alice's password
+        locks out only their own attempts, not alice logging in from elsewhere;
+      * client address alone, with a higher limit: stops one client spraying
+        guesses across many usernames.
+    Once a counter reaches its limit within the window, that key is locked
+    until `lockout` seconds after its most recent failure.
+    """
+
+    def __init__(self, store, max_failures=config.MAX_LOGIN_FAILURES,
+                 max_client_failures=config.MAX_CLIENT_LOGIN_FAILURES,
                  window=config.LOGIN_FAILURE_WINDOW_SECONDS,
                  lockout=config.LOGIN_LOCKOUT_SECONDS):
-        self.max_failures = max_failures
+        self.store = store
         self.window = window
         self.lockout = lockout
-        self._failures = {}
-        self._locked_until = {}
-        self._lock = threading.Lock()
+        self.max_failures = max_failures
+        self.max_client_failures = max_client_failures
 
-    def locked_for(self, username):
-        """Seconds the username remains locked out (0 if not locked)."""
-        with self._lock:
-            return max(0.0, self._locked_until.get(username, 0) - time.time())
+    @staticmethod
+    def _account_key(username, client):
+        return f"account:{username}|client:{client}"
 
-    def record_failure(self, username):
+    @staticmethod
+    def _client_key(client):
+        return f"client:{client}"
+
+    def locked_for(self, username, client):
+        """Seconds this attempt must wait (0 if it may proceed)."""
         now = time.time()
-        with self._lock:
-            recent = [t for t in self._failures.get(username, []) if now - t < self.window]
-            recent.append(now)
-            if len(recent) >= self.max_failures:
-                self._locked_until[username] = now + self.lockout
-                recent = []
-            self._failures[username] = recent
+        remaining = 0.0
+        for key, limit in ((self._account_key(username, client), self.max_failures),
+                           (self._client_key(client), self.max_client_failures)):
+            count, latest = self.store.login_failures(key, now - self.window)
+            if count >= limit:
+                remaining = max(remaining, latest + self.lockout - now)
+        return remaining
 
-    def record_success(self, username):
-        with self._lock:
-            self._failures.pop(username, None)
+    def record_failure(self, username, client):
+        self.store.record_login_failure(
+            [self._account_key(username, client), self._client_key(client)], time.time(), self.window)
+
+    def record_success(self, username, client):
+        # Only the account counter is cleared: logging into an account the
+        # client owns must not reset its budget for guessing other accounts.
+        self.store.clear_login_failures(self._account_key(username, client))
 
 
 class TokenError(Exception):

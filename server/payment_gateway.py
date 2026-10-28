@@ -27,9 +27,9 @@ import bank_pb2_grpc
 import payment_gateway_pb2
 import payment_gateway_pb2_grpc
 from auth import LoginThrottle, TokenError, TokenManager, _DUMMY_HASH, load_users, verify_password
-from interceptor import AuthorizationInterceptor, LoggingInterceptor
+from interceptor import AuthorizationInterceptor, LoggingInterceptor, PeerIdentityInterceptor
 from storage import SQLiteStore
-from tls import peer_common_name, secure_channel, server_credentials
+from tls import peer_common_name, peer_host, secure_channel, server_credentials
 
 log = logging.getLogger("gateway")
 
@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS revoked_tokens (
     jti TEXT PRIMARY KEY,
     expires_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS login_failures (
+    key TEXT NOT NULL,
+    at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS login_failures_key ON login_failures (key, at);
 """
 
 
@@ -143,6 +148,21 @@ class CoordinatorLog(SQLiteStore):
 
     def is_revoked(self, jti):
         return bool(self.query("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)))
+
+    # -- failed logins (used by auth.LoginThrottle) ------------------------
+    def record_login_failure(self, keys, at, window):
+        with self.transaction() as db:
+            db.execute("DELETE FROM login_failures WHERE at < ?", (at - window,))
+            db.executemany("INSERT INTO login_failures VALUES (?, ?)", [(key, at) for key in keys])
+
+    def login_failures(self, key, since):
+        """Return (count, latest timestamp) of failures for key since `since`."""
+        row = self.query("SELECT COUNT(*), MAX(at) FROM login_failures WHERE key = ? AND at >= ?", (key, since))[0]
+        return row[0], row[1] or 0.0
+
+    def clear_login_failures(self, key):
+        with self.transaction() as db:
+            db.execute("DELETE FROM login_failures WHERE key = ?", (key,))
 
 
 class BankUnavailable(Exception):
@@ -346,17 +366,18 @@ class PaymentGatewayService(payment_gateway_pb2_grpc.PaymentGatewayServicer):
 
     def AuthenticateClient(self, request, context):
         username = request.username
-        locked_for = self.throttle.locked_for(username)
+        client = peer_host(context)
+        locked_for = self.throttle.locked_for(username, client)
         if locked_for > 0:
             context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED,
                           f"Too many failed attempts; try again in {locked_for:.0f}s")
         user = self.users.get(username)
         ok = verify_password(request.password, user["password_hash"] if user else _DUMMY_HASH)
         if not (ok and user):
-            self.throttle.record_failure(username)
-            log.warning("Failed login for %r from %s", username, context.peer())
+            self.throttle.record_failure(username, client)
+            log.warning("Failed login for %r from %s", username, client)
             return payment_gateway_pb2.AuthResponse(authenticated=False, message="Invalid username or password")
-        self.throttle.record_success(username)
+        self.throttle.record_success(username, client)
         log.info("%s logged in", username)
         return payment_gateway_pb2.AuthResponse(authenticated=True, token=self.tokens.issue(username),
                                                 message="Login successful")
@@ -485,12 +506,15 @@ def build_gateway(port=config.GATEWAY_PORT, *, cert_dir=None, data_dir=None, use
     coordinator = Coordinator(coordinator_log, banks, rpc_timeout=rpc_timeout, prepare_timeout=prepare_timeout)
     tokens = TokenManager(coordinator_log, secret=jwt_secret)
     service = PaymentGatewayService(users if users is not None else load_users(), coordinator_log, banks,
-                                    coordinator, tokens, LoginThrottle())
+                                    coordinator, tokens, LoginThrottle(coordinator_log))
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=32),
         interceptors=[
             LoggingInterceptor(),
+            # User RPCs only from client applications; RegisterBank checks
+            # for the registering bank's own certificate itself.
+            PeerIdentityInterceptor({config.CLIENT_CN}, exempt_methods={"RegisterBank"}),
             AuthorizationInterceptor(tokens, exempt_methods={"AuthenticateClient", "RegisterBank"}),
         ],
     )

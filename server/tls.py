@@ -41,6 +41,14 @@ def secure_channel(target, cert_dir, name):
     return grpc.secure_channel(target, channel_credentials(cert_dir, name), options=CHANNEL_OPTIONS)
 
 
+def peer_host(context):
+    """Caller's address without the port, e.g. '10.0.0.5' or '::1'."""
+    kind, _, rest = context.peer().partition(":")
+    if kind in ("ipv4", "ipv6"):
+        return rest.rsplit(":", 1)[0].strip("[]")
+    return context.peer()
+
+
 def peer_common_name(context):
     """Common name of the verified peer certificate, or None."""
     names = context.auth_context().get("x509_common_name") or []

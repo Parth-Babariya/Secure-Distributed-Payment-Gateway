@@ -33,8 +33,10 @@ def bank_cn(bank_name):
 JWT_SECRET = os.environ.get("PG_JWT_SECRET")
 TOKEN_TTL_SECONDS = int(os.environ.get("PG_TOKEN_TTL_SECONDS", "900"))
 
-# Login throttling: lock a username after this many failures in the window.
+# Login throttling: failures allowed within the window per (username, client
+# address), and per client address across all usernames.
 MAX_LOGIN_FAILURES = 5
+MAX_CLIENT_LOGIN_FAILURES = 20
 LOGIN_FAILURE_WINDOW_SECONDS = 300
 LOGIN_LOCKOUT_SECONDS = 60
 

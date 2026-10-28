@@ -52,12 +52,19 @@ class AuthorizationInterceptor(grpc.ServerInterceptor):
 
 
 class PeerIdentityInterceptor(grpc.ServerInterceptor):
-    """Only lets callers whose mTLS certificate CN is in `allowed` through."""
+    """Only lets callers whose mTLS certificate CN is in `allowed` through.
 
-    def __init__(self, allowed):
+    Methods in `exempt_methods` skip this check and must authorise the caller
+    themselves (the gateway's RegisterBank checks for the bank's own CN).
+    """
+
+    def __init__(self, allowed, exempt_methods=()):
         self.allowed = set(allowed)
+        self.exempt_methods = set(exempt_methods)
 
     def intercept_service(self, continuation, handler_call_details):
+        if _method_name(handler_call_details.method) in self.exempt_methods:
+            return continuation(handler_call_details)
         allowed = self.allowed
 
         def factory(behaviour):
