@@ -40,7 +40,10 @@ revocable JWT sessions, and every 2PC vote and decision is written to a SQLite
 log before it is acted on, so the system recovers from a crash of the gateway
 or of any bank at any point. A chaos experiment that hard-killed components 15
 times during 2,747 payments ended with every payment atomic and the total money
-unchanged; 49 automated tests cover payments, security, recovery and storage. This
+unchanged. The coordinator can also run as several gateways sharing a
+Raft-replicated log in etcd, which removes the blocking weakness of 2PC; 55
+automated tests cover payments, security, recovery, storage and the replicated
+mode. This
 report describes the design, argues its correctness, and presents the
 measurements.
 \end{abstract}
@@ -362,9 +365,71 @@ banks is therefore constant. The chaos experiment
 
 \paragraph{Liveness and its limit.}
 Under the assumptions above, every payment reaches \st{Committed} or
-\st{Aborted}. 2PC is, however, a \emph{blocking} protocol: while the gateway is
-down, a bank that voted yes must keep its reservation, because it cannot know
-the decision. The funds are safe but unavailable until the gateway returns.
+\st{Aborted}. 2PC is, however, a \emph{blocking} protocol: while the
+coordinator is down, a bank that voted yes must keep its reservation, because
+it cannot know the decision. With a single gateway the funds are safe but
+unavailable until it returns. Section~\ref{sec:replicated} removes this limit
+by replicating the coordinator.
+
+\section{Replicated Coordinator}
+\label{sec:replicated}
+The blocking problem is a problem of the coordinator's \emph{state}, not of
+the process: any process that can read the durable decision can finish the
+protocol. When \code{PG_ETCD_ENDPOINTS} is set, the coordinator log is
+therefore stored in a three-node etcd cluster instead of \code{gateway.db}.
+etcd replicates every write to a majority of its nodes with the Raft
+consensus protocol before acknowledging it, so the log survives the loss of
+any one node, and any number of gateways can share it. This is the approach
+of systems such as Spanner, whose 2PC coordinators are themselves replicated
+by consensus.
+
+\paragraph{Design.}
+\begin{itemize}
+  \item \textbf{Same protocol, shared log.} Payments, the bank directory,
+        revoked tokens and login failures are etcd keys. Every status change
+        is an etcd transaction conditioned on the payment record's
+        \code{mod_revision}: the same compare-and-set as with SQLite, now
+        linearizable across gateways. No gateway owns a payment.
+  \item \textbf{Recovery by anyone.} Every gateway runs the recovery worker
+        over the shared log. Decided payments get a short grace period (one
+        RPC timeout) so that the gateway running them is not duplicated by the
+        others; after that, any gateway resends the decision. A payment
+        abandoned in \st{Preparing} is presumed aborted by whichever gateway
+        sees it first.
+  \item \textbf{Shared sessions.} Tokens are verified with the shared
+        Ed25519 public keys, and revocations and lockouts are in etcd, so a
+        session works at, and a logout or lockout applies to, every gateway.
+        Revocations and failed-login records are attached to etcd leases and
+        expire on their own.
+  \item \textbf{Failover.} Clients and banks list every gateway; gRPC balances
+        calls round-robin over the live ones, so a gateway crash fails only
+        the calls in flight on it, and those are safe to retry with the same
+        transaction id.
+  \item \textbf{Isolation.} etcd requires mutual TLS from clients and between
+        its Raft peers, with certificates from a CA of its own; only gateways
+        hold one. A request whose reply is lost is retried; a payment insert
+        carries a random attempt id so that a retried insert recognises its
+        own earlier success.
+\end{itemize}
+
+\paragraph{Correctness.}
+The arguments of the previous section carry over unchanged, because they rely
+only on the log being durable and on decisions being made by compare-and-set:
+etcd provides both, linearizably, for every gateway. Two gateways racing on one
+payment (one executing it, one recovering it) cannot both change its state
+from \st{Preparing}; the loser re-reads the record and follows the recorded
+decision.
+
+\paragraph{Availability.}
+With three gateways and three etcd nodes, payments continue through the
+failure of any one gateway and any one etcd node. Payments involving a bank
+that is down still wait for that bank, since each bank is a single server.
+
+\paragraph{Cost.}
+Every state change is a consensus round, so a payment takes longer. On the
+laptop, one client completed about 26--30 payments/s (median 33\,ms) against
+about 67/s (14\,ms) with one gateway on SQLite; at 32 clients, about 182
+against 256--270 payments/s.
 
 \section{Offline Payments \& Retry Mechanism}
 \label{sec:offline}
@@ -420,7 +485,7 @@ Delayed prepare after an abort & Refused because of the abort tombstone. \\
 \section{Evaluation}
 
 \subsection{Automated tests}
-49 pytest tests, most of which start a gateway and three banks in-process on free ports:
+55 pytest tests, most of which start a gateway and three banks in-process on free ports:
 \begin{itemize}
   \item \textbf{Payments (7):} cross-bank transfer; insufficient funds;
         server-side rejection of zero, negative and oversized amounts; specific
@@ -443,6 +508,11 @@ Delayed prepare after an abort & Refused because of the abort tombstone. \\
         rotation that keeps existing sessions valid.
   \item \textbf{Storage (5):} concurrent writes share commits; a failing write
         rolls back only itself; data is on disk when \code{write()} returns.
+  \item \textbf{Replicated coordinator (6),} against a real three-node etcd
+        cluster: sessions, payments, idempotent retries, logout and lock-outs
+        across gateways; one gateway completing, or presuming aborted, payments
+        left by another that crashed; payments continuing with an etcd node
+        down; racing compare-and-sets with exactly one winner.
 \end{itemize}
 
 \subsection{Chaos experiment}
@@ -475,6 +545,16 @@ Money before / after & \rupee23,000.00 / \rupee23,000.00 \\
 The aborts combine insufficient-funds outcomes (the workload draws random
 amounts against small balances) with payments that a kill interrupted before a
 commit decision.
+
+The same experiment with \code{--replicated} runs three etcd nodes, three
+gateways and the three banks, and kills any of them, one at a time. A 60-second
+run killed 22 components (5 gateways, 9 etcd nodes, 8 banks) during 4,164
+payments (3,433 committed, 731 aborted). The audit again found every payment
+atomic, nothing in doubt and the money unchanged. Recovery workers settled 46
+in-doubt payments, often on a gateway other than the one that had started
+them, and presumed 7 abandoned payments aborted. Only 0.3\% of client calls
+failed with \code{UNAVAILABLE}, against 0.6\% in a 60-second single-gateway
+run: with several gateways, only the calls in flight on the killed one fail.
 
 \subsection{Throughput and latency}
 \code{scripts/benchmark.py} runs the same multi-process deployment (mTLS on
@@ -569,17 +649,23 @@ Under \code{FULL} the fsync noise exceeded the difference.
 \code{docker compose up} runs a one-shot job that creates the CA and writes
 each component's credentials into its own volume, then starts the gateway and
 the three banks, each with its own credentials and data volumes. The client
-runs with \code{docker compose run client}. GitHub Actions runs the test suite,
-the chaos experiment, a check that the generated protobuf code is up to date,
+runs with \code{docker compose run client}. GitHub Actions installs etcd
+(\code{scripts/get_etcd.py} checks the release's SHA-256) and runs the test
+suite, the chaos experiment in both layouts, a check that the generated protobuf code is up to date,
 and a Docker Compose smoke test that also verifies each container holds only
 its own key.
 
 \section{Limitations \& Future Enhancements}
 \begin{itemize}
-  \item \textbf{Coordinator availability.} The gateway is a single coordinator,
-        and 2PC blocks while it is down. Replicating the coordinator log with a
-        consensus protocol (Raft or Paxos), as Spanner does, would let another
-        replica finish in-doubt payments.
+  \item \textbf{Participant availability.} The coordinator can be
+        replicated, but each bank is a single server, so a payment involving a
+        bank that is down waits for it. A real bank would replicate its ledger
+        as well.
+  \item \textbf{Clocks.} Gateways compare wall-clock times to decide that an
+        undecided payment has timed out. Large skew could cause an early, and
+        still atomic, abort.
+  \item \textbf{Deployment.} Docker Compose runs a single gateway on SQLite;
+        the replicated layout runs as local processes.
   \item \textbf{Storage.} Group commit shares fsyncs, but each process still
         applies its writes one at a time on one SQLite connection. PostgreSQL
         with row-level locking would let independent accounts proceed in
