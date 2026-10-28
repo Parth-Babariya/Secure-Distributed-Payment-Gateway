@@ -40,7 +40,7 @@ revocable JWT sessions, and every 2PC vote and decision is written to a SQLite
 log before it is acted on, so the system recovers from a crash of the gateway
 or of any bank at any point. A chaos experiment that hard-killed components 15
 times during 2,747 payments ended with every payment atomic and the total money
-unchanged; 33 automated tests cover payments, security and recovery. This
+unchanged; 39 automated tests cover payments, security and recovery. This
 report describes the design, argues its correctness, and presents the
 measurements.
 \end{abstract}
@@ -168,7 +168,14 @@ Because a bank may only register under the name in its own certificate, a
 client or a different bank cannot redirect HDFC's traffic to an address it
 controls. Because banks accept only the gateway's certificate, nobody can call
 \code{PrepareTransaction} or \code{CommitTransaction} directly to create or
-move money.
+move money. Conversely, user RPCs accept only the client certificate, so a
+stolen JWT cannot be used over a bank's or the gateway's certificate.
+
+In the Docker deployment each container mounts a volume holding only its own
+key, its certificate and \code{ca.crt}. The CA's private key stays in a volume
+that no running service mounts, so compromising one bank container exposes
+neither the gateway's key nor the ability to issue new certificates. CI checks
+this layout.
 
 \subsection{User authentication}
 \begin{itemize}
@@ -176,8 +183,14 @@ move money.
         ($N=2^{14}, r=8, p=1$) and compared in constant time. A login for an
         unknown user verifies against a dummy hash, so response time does not
         reveal which usernames exist.
-  \item Five failed logins within five minutes lock the username for 60 seconds
-        (\code{RESOURCE_EXHAUSTED}).
+  \item Failed logins are rate-limited with two counters stored in
+        \code{gateway.db}: five failures in five minutes per
+        (username, client address), and twenty per client address across all
+        usernames. Either limit blocks further attempts for 60 seconds
+        (\code{RESOURCE_EXHAUSTED}). Because the per-user counter includes the
+        address, an attacker cannot lock the real user out from elsewhere, and
+        the address-wide counter stops password spraying. A restart does not
+        reset the counters.
   \item A successful login returns an HS256 JWT with subject, issue time,
         15-minute expiry and a unique id (\code{jti}). The signing key comes
         from \code{PG_JWT_SECRET} and must be at least 32 characters.
@@ -234,8 +247,8 @@ After validation the gateway inserts the payment into \code{gateway.db} with
 status \st{Preparing}. The client-generated transaction id is the primary key.
 
 \subsection{Phase 1: prepare}
-The gateway asks the sender's bank to prepare a \st{Debit} and the receiver's
-bank to prepare a \st{Credit}. Each bank votes inside one serialised SQLite
+The gateway asks, in parallel, the sender's bank to prepare a \st{Debit} and
+the receiver's bank to prepare a \st{Credit}. Each bank votes inside one serialised SQLite
 transaction (\code{BEGIN IMMEDIATE}):
 \begin{itemize}
   \item \textbf{Debit:} vote yes only if
@@ -395,16 +408,18 @@ Delayed prepare after an abort & Refused because of the abort tombstone. \\
 \section{Evaluation}
 
 \subsection{Automated tests}
-33 pytest tests start a gateway and three banks in-process on free ports:
+39 pytest tests start a gateway and three banks in-process on free ports:
 \begin{itemize}
   \item \textbf{Payments (7):} cross-bank transfer; insufficient funds;
         server-side rejection of zero, negative and oversized amounts; specific
         error codes; idempotent retries; a double-spend attempt with 40
         concurrent \rupee100 payments against a \rupee1,500 balance (exactly 15
         succeed); 120 random concurrent transfers that must conserve money.
-  \item \textbf{Security (7):} missing, forged, expired and revoked tokens;
-        revocation surviving a restart; login lock-out; access to another
-        user's account; bank impersonation; non-gateway callers at a bank.
+  \item \textbf{Security (13):} missing, forged, expired and revoked tokens;
+        revocation surviving a restart; login lock-out scoped to the client
+        address and surviving a restart; password spraying; access to another
+        user's account; bank impersonation; non-client certificates on user
+        RPCs; non-gateway callers at a bank; the per-component key layout.
   \item \textbf{Recovery (7):} receiver commit failure; bank down during
         prepare; gateway crash after the decision; gateway crash before the
         decision; bank crash after voting yes; late prepare after abort;
@@ -459,12 +474,12 @@ each bank.
   \foreach \y in {50,100,150,200} {\draw (0.08,\y) -- (-0.08,\y) node[left,font=\scriptsize] {\y};
     \draw[black!10] (0.1,\y) -- (6.8,\y);}
   \foreach \x/\l in {0.8/1,2.4/4,4.0/16,5.6/32} {\draw (\x,3) -- (\x,-3) node[below,font=\scriptsize] {\l};}
-  \draw[very thick,blue!70!black] (0.8,57) -- (2.4,77) -- (4.0,49) -- (5.6,67);
-  \foreach \x/\y in {0.8/57,2.4/77,4.0/49,5.6/67} {\fill[blue!70!black] (\x,\y) circle (2pt);}
-  \draw[very thick,orange!85!black,dashed] (0.8,118) -- (2.4,187) -- (4.0,208) -- (5.6,226);
-  \foreach \x/\y in {0.8/118,2.4/187,4.0/208,5.6/226} {\fill[orange!85!black] (\x,\y) circle (2pt);}
-  \node[font=\scriptsize,blue!70!black,anchor=west] at (5.75,67) {FULL};
-  \node[font=\scriptsize,orange!85!black,anchor=west] at (5.75,226) {NORMAL};
+  \draw[very thick,blue!70!black] (0.8,63) -- (2.4,118) -- (4.0,124) -- (5.6,119);
+  \foreach \x/\y in {0.8/63,2.4/118,4.0/124,5.6/119} {\fill[blue!70!black] (\x,\y) circle (2pt);}
+  \draw[very thick,orange!85!black,dashed] (0.8,121) -- (2.4,203) -- (4.0,223) -- (5.6,241);
+  \foreach \x/\y in {0.8/121,2.4/203,4.0/223,5.6/241} {\fill[orange!85!black] (\x,\y) circle (2pt);}
+  \node[font=\scriptsize,blue!70!black,anchor=west] at (5.75,119) {FULL};
+  \node[font=\scriptsize,orange!85!black,anchor=west] at (5.75,241) {NORMAL};
 \end{tikzpicture}
 \caption{Throughput with SQLite \code{synchronous=FULL} (fsync on every commit,
 the default) and \code{NORMAL}.}
@@ -477,10 +492,10 @@ the default) and \code{NORMAL}.}
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
 Clients & TPS & p50 / p99 (ms) & TPS & p50 / p99 (ms) \\
 \midrule
-1  & 57 & 16 / 29   & 118 & 8 / 21 \\
-4  & 77 & 42 / 328  & 187 & 20 / 40 \\
-16 & 49 & 319 / 489 & 208 & 72 / 134 \\
-32 & 67 & 391 / 713 & 226 & 134 / 221 \\
+1  & 63  & 15 / 28   & 121 & 8 / 15 \\
+4  & 118 & 33 / 48   & 203 & 18 / 44 \\
+16 & 124 & 128 / 172 & 223 & 66 / 126 \\
+32 & 119 & 247 / 636 & 241 & 129 / 206 \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -488,12 +503,22 @@ Clients & TPS & p50 / p99 (ms) & TPS & p50 / p99 (ms) \\
 \paragraph{Discussion.}
 With full durability, throughput is limited by disk flushes, not by gRPC or
 TLS. Every commit waits for an fsync, and each process issues its writes one at
-a time, so adding clients mostly adds queueing delay. Relaxing to
-\code{NORMAL}, which in WAL mode still survives process crashes but may lose
-the last commits on an operating-system crash or power loss, gives 2--4$\times$
-the throughput and much lower tail latency. The usual way to keep full
-durability at higher throughput is \emph{group commit}: one fsync shared by
-the writes of many concurrent payments.
+a time, so beyond about four clients extra clients mostly add queueing delay.
+Relaxing to \code{NORMAL} roughly doubles throughput. In WAL mode that setting
+still survives process crashes, but it may lose the last commits on an
+operating-system crash or power loss. \code{FULL} results also vary by up to
+2--3$\times$ between runs on this laptop, because flush latency is noisy. The
+usual way to keep full durability at higher throughput is \emph{group commit}:
+one fsync shared by the writes of many concurrent payments.
+
+\paragraph{Parallel prepare.}
+The gateway asks both banks to prepare at the same time. An A/B comparison
+alternated three runs each of sequential and parallel prepare under
+\code{NORMAL}. Parallel prepare cut single-client median latency from 10.2\,ms
+to 8.1\,ms and raised single-client throughput from 92 to 110 payments/s. At
+4--16 clients the two were within run-to-run noise: there, throughput is
+limited by serialised database writes rather than by the extra round trip.
+Under \code{FULL} the fsync noise exceeded the difference.
 
 \section{Assumptions}
 \begin{enumerate}
@@ -511,11 +536,13 @@ the writes of many concurrent payments.
 \end{enumerate}
 
 \section{Deployment}
-\code{docker compose up} generates certificates into a shared volume and
-starts the gateway and the three banks, each with its own data volume; the
-client runs with \code{docker compose run client}. GitHub Actions runs the
-test suite, the chaos experiment, a check that the generated protobuf code is
-up to date, and a Docker Compose smoke test.
+\code{docker compose up} runs a one-shot job that creates the CA and writes
+each component's credentials into its own volume, then starts the gateway and
+the three banks, each with its own credentials and data volumes. The client
+runs with \code{docker compose run client}. GitHub Actions runs the test suite,
+the chaos experiment, a check that the generated protobuf code is up to date,
+and a Docker Compose smoke test that also verifies each container holds only
+its own key.
 
 \section{Limitations \& Future Enhancements}
 \begin{itemize}
@@ -526,8 +553,6 @@ up to date, and a Docker Compose smoke test.
   \item \textbf{Storage.} SQLite with one connection per process serialises
         writes. PostgreSQL with group commit would raise throughput while
         keeping full durability.
-  \item \textbf{Latency.} The two prepares run one after the other; running
-        them in parallel would remove one round trip from every payment.
   \item \textbf{Identity.} Users come from a JSON file, and tokens are signed
         with one shared HS256 key. A production system would use a user
         database and asymmetric signing keys (RS256 or EdDSA) with rotation.

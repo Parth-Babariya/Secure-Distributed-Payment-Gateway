@@ -48,7 +48,7 @@ PREPARING --both banks vote yes--> COMMITTING --both acknowledge--> COMMITTED
 
 1. **Validate.** The gateway checks the JWT, that the amount is positive and within limits, and that the sender owns the source account and the receiver account exists. Amounts are integer **paise**, never floats.
 2. **Log.** The payment is inserted as `PREPARING`. The client-generated transaction id is the primary key, so a retry with the same id returns the stored outcome instead of charging twice.
-3. **Phase 1 (prepare).** The sender's bank *reserves* the funds, which reduces the available balance; the receiver's bank checks that the account exists. Each bank writes its vote to its own SQLite ledger before replying, so a bank that crashes after voting yes still honours the decision when it restarts.
+3. **Phase 1 (prepare).** Both banks are asked in parallel. The sender's bank *reserves* the funds, which reduces the available balance; the receiver's bank checks that the account exists. Each bank writes its vote to its own SQLite ledger before replying, so a bank that crashes after voting yes still honours the decision when it restarts.
 4. **Decision.** The gateway durably records `COMMITTING` (or `ABORTING`) *before* telling any bank, using a compare-and-set on the status.
 5. **Phase 2.** Commit and abort are idempotent at the banks, so the gateway can retry them safely. An abort for a transaction a bank never saw leaves a tombstone, so a delayed prepare arriving later is refused.
 6. **Recovery.** A background worker, which also runs right after a restart, retries phase 2 for every `COMMITTING`/`ABORTING` payment until both banks acknowledge. A payment stuck in `PREPARING` past a timeout is aborted (*presumed abort*), because no commit decision was ever logged.
@@ -61,11 +61,13 @@ PREPARING --both banks vote yes--> COMMITTING --both acknowledge--> COMMITTED
 |---|---|
 | Eavesdropping or tampering | mTLS on every hop; the CA signs a separate certificate for each component |
 | Leaked keys in the repository | No keys are committed. `scripts/gen_certs.py` creates them locally, in Docker, and in tests |
+| One compromised container exposing every key | In Docker each container mounts only its own key, its certificate and `ca.crt`; the CA key is in a volume no running service mounts (checked in CI) |
 | Calling a bank directly to mint or move money | Banks accept calls only from the certificate with CN `gateway` |
 | Impersonating a bank to divert its traffic | `RegisterBank` requires the caller's certificate CN to be `<bank>.bank` |
+| Using a bank or gateway certificate to act as a user | User RPCs accept only the `client` certificate, even with a valid JWT |
 | Negative or oversized amounts | Validated on the server; the banks also reject amounts ≤ 0 |
 | Stolen password database | Passwords are stored as salted scrypt hashes and compared in constant time; logins for unknown users take the same time |
-| Password guessing | 5 failures within 5 minutes lock the username for 60 s |
+| Password guessing | 5 failures in 5 minutes per (username, client address), and 20 per client address across all usernames, lock further attempts for 60 s. Attempts are counted per address, so an attacker cannot lock the real user out from elsewhere; the counts are stored, so a restart does not reset them |
 | Token theft after logout | Each JWT has a `jti` that logout revokes; the revocation list is persisted, so it survives restarts |
 | Weak or hard-coded JWT secret | Read from `PG_JWT_SECRET`, at least 32 characters; a random per-process secret is used if it is unset |
 | Reusing another user's transaction id | Idempotency is bound to the user and the payment parameters; a mismatch returns `ALREADY_EXISTS` |
@@ -123,7 +125,7 @@ Opening balances come from [server/bank_data.json](server/bank_data.json) the fi
 ## Testing
 
 ```sh
-pytest -q                                   # 33 tests, ~25 s
+pytest -q                                   # 39 tests, ~25 s
 python scripts/chaos_demo.py --seconds 60   # kill processes mid-payment, then audit
 python scripts/benchmark.py                 # throughput and latency
 ```
@@ -131,7 +133,7 @@ python scripts/benchmark.py                 # throughput and latency
 The [tests](tests/) start a gateway and three banks in-process on free ports and cover:
 
 - **Payments.** Cross-bank transfers, insufficient funds, server-side amount validation, a specific status code for each error, idempotent retries, a concurrent double-spend attempt, and 120 random concurrent transfers that must conserve money.
-- **Security.** Missing, forged, expired and revoked tokens; revocation surviving a restart; login lockout; reading another user's account; bank impersonation; non-gateway callers hitting a bank.
+- **Security.** Missing, forged, expired and revoked tokens; revocation surviving a restart; login lockout scoped to the client address and surviving a restart; password spraying across usernames; reading another user's account; bank impersonation; non-client certificates calling user RPCs; non-gateway callers hitting a bank; the per-component key layout.
 - **Recovery (fault injection).**
   - A receiver bank's commit fails, then the retry succeeds.
   - A bank is down during prepare.
@@ -141,7 +143,7 @@ The [tests](tests/) start a gateway and three banks in-process on free ports and
   - A late prepare arrives after the abort.
 - **Client.** Rupee parsing; an offline payment queued to disk and sent exactly once after the gateway returns.
 
-CI runs the suite, the chaos demo, a check that the generated protobuf code is up to date, and a Docker Compose smoke test.
+CI runs the suite, the chaos demo, a check that the generated protobuf code is up to date, and a Docker Compose smoke test that also checks each container holds only its own key.
 
 ### Chaos demo
 
@@ -163,19 +165,20 @@ End-to-end payments (gateway and three banks as separate processes, mTLS on ever
 
 | Concurrent clients | TPS (`FULL` fsync) | p50 / p99 ms | TPS (`NORMAL`) | p50 / p99 ms |
 |---:|---:|---:|---:|---:|
-| 1 | 57 | 16 / 29 | 118 | 8 / 21 |
-| 4 | 77 | 42 / 328 | 187 | 20 / 40 |
-| 16 | 49 | 319 / 489 | 208 | 72 / 134 |
-| 32 | 67 | 391 / 713 | 226 | 134 / 221 |
+| 1 | 63 | 15 / 28 | 121 | 8 / 15 |
+| 4 | 118 | 33 / 48 | 203 | 18 / 44 |
+| 16 | 124 | 128 / 172 | 223 | 66 / 126 |
+| 32 | 119 | 247 / 636 | 241 | 129 / 206 |
 
-Each payment makes three durable writes at the gateway and two at each bank. With `FULL` durability, fsync is the bottleneck: relaxing it to `NORMAL` gives about 4× the throughput. The next step would be group commit, batching the log writes of many concurrent payments into one fsync.
+Each payment makes three durable writes at the gateway and two at each bank. With `FULL` durability, fsync is the bottleneck: relaxing it to `NORMAL` roughly doubles throughput. `FULL` results also vary up to 2–3× between runs on this laptop because flush latency is noisy. The next step would be group commit: one fsync shared by the log writes of many concurrent payments.
+
+**Parallel prepare (A/B).** Three runs each of sequential and parallel prepare were alternated under `NORMAL`. Parallel prepare cut single-client median latency from 10.2 ms to 8.1 ms and raised single-client throughput from 92 to 110 payments/s. At 4–16 clients the two were within run-to-run noise, because throughput there is limited by serialised database writes, not by the round trip. Under `FULL` the fsync noise was larger than the difference.
 
 ## Limitations and next steps
 
 - **The coordinator is a single point of failure.** 2PC is a blocking protocol: while the gateway is down, prepared reservations stay held until it recovers, which is safe but not available. Running the coordinator log on a replicated store (Raft or Paxos) would remove this; it is what systems like Spanner do.
 - **One SQLite connection per process** serialises writes. A production system would use PostgreSQL and group commit.
 - **Users live in a JSON file**, and the JWT uses a single shared HS256 key. A real deployment would use a user database and asymmetric keys (RS256 or EdDSA) with rotation.
-- **Prepare runs sequentially** at the two banks; running both in parallel would cut latency.
 
 ## Repository layout
 
