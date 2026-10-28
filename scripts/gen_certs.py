@@ -3,7 +3,7 @@
 Certificates are never committed: run this once after cloning (or let Docker
 Compose and the test suite run it). Usage:
 
-    python scripts/gen_certs.py [--out certs] [--banks HDFC ICICI SBI] [--force]
+    python scripts/gen_certs.py [--out certs] [--banks HDFC ICICI SBI] [--force] [--split]
 """
 import argparse
 import datetime
@@ -93,16 +93,24 @@ def make_leaf(ca_key, ca_cert, common_name, dns_names):
     return key, cert
 
 
-def generate(out_dir, banks=DEFAULT_BANKS, force=False):
+def generate(out_dir, banks=DEFAULT_BANKS, force=False, split=False):
+    """Write the CA and one certificate per component.
+
+    By default everything goes into one directory (local development and
+    tests). With split=True the CA goes into <out>/ca/ and each component gets
+    <out>/<name>/ holding only its own key, its certificate and ca.crt, so a
+    deployment can give each process access to nothing but its own key.
+    """
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if (out_dir / "ca.crt").exists() and not force:
+    ca_dir = out_dir / "ca" if split else out_dir
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    if (ca_dir / "ca.crt").exists() and not force:
         print(f"Certificates already exist in {out_dir} (use --force to regenerate)")
         return
 
     ca_key, ca_cert = make_ca()
-    _write(out_dir / "ca.key", _key_bytes(ca_key))
-    _write(out_dir / "ca.crt", _cert_bytes(ca_cert))
+    _write(ca_dir / "ca.key", _key_bytes(ca_key))
+    _write(ca_dir / "ca.crt", _cert_bytes(ca_cert))
 
     # Identity name -> (certificate CN, DNS names it may be reached at).
     identities = {
@@ -115,9 +123,13 @@ def generate(out_dir, banks=DEFAULT_BANKS, force=False):
 
     for file_name, (common_name, dns_names) in identities.items():
         key, cert = make_leaf(ca_key, ca_cert, common_name, dns_names)
-        _write(out_dir / f"{file_name}.key", _key_bytes(key))
-        _write(out_dir / f"{file_name}.crt", _cert_bytes(cert))
-    print(f"Wrote CA and {len(identities)} certificates to {out_dir}")
+        target = out_dir / file_name if split else out_dir
+        target.mkdir(parents=True, exist_ok=True)
+        _write(target / f"{file_name}.key", _key_bytes(key))
+        _write(target / f"{file_name}.crt", _cert_bytes(cert))
+        if split:
+            _write(target / "ca.crt", _cert_bytes(ca_cert))
+    print(f"Wrote CA and {len(identities)} certificates to {out_dir}" + (" (one directory each)" if split else ""))
 
 
 def main(argv=None):
@@ -125,8 +137,10 @@ def main(argv=None):
     parser.add_argument("--out", default=str(ROOT / "certs"))
     parser.add_argument("--banks", nargs="+", default=DEFAULT_BANKS)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--split", action="store_true",
+                        help="one directory per component, CA key kept apart (used by Docker Compose)")
     args = parser.parse_args(argv)
-    generate(args.out, args.banks, args.force)
+    generate(args.out, args.banks, args.force, args.split)
 
 
 if __name__ == "__main__":

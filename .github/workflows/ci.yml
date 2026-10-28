@@ -35,5 +35,12 @@ jobs:
             sleep 2
           done
           docker compose logs; exit 1
+      - name: Each container holds only its own key
+        run: |
+          for svc in gateway hdfc icici sbi; do
+            files=$(docker compose exec -T $svc ls /certs | sort | tr '\n' ' ')
+            echo "$svc: $files"
+            [ "$files" = "ca.crt $svc.crt $svc.key " ] || exit 1
+          done
       - if: always()
         run: docker compose down -v

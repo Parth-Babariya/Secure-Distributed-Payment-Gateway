@@ -1,11 +1,14 @@
 # Gateway + three banks, each with its own mTLS identity and durable volume.
 #   docker compose up --build -d
 #   docker compose run --rm client
+#
+# The one-shot `certs` service creates the CA and writes each component's key
+# into a separate volume. Every runtime container mounts only its own volume,
+# which holds its key, its certificate and ca.crt. The CA's private key lives
+# in the `certs-ca` volume, which no runtime container mounts.
 x-common: &common
   build: .
   image: secure-payment-gateway
-  volumes:
-    - certs:/certs:ro
   environment: &env
     PG_GATEWAY_ADDRESS: gateway:50052
     PG_JWT_SECRET: ${PG_JWT_SECRET:-change-me-to-a-long-random-secret-in-production}
@@ -17,9 +20,14 @@ services:
   certs:
     build: .
     image: secure-payment-gateway
-    command: python /app/scripts/gen_certs.py --out /certs
+    command: python /app/scripts/gen_certs.py --out /certs --split
     volumes:
-      - certs:/certs
+      - certs-ca:/certs/ca
+      - certs-gateway:/certs/gateway
+      - certs-hdfc:/certs/hdfc
+      - certs-icici:/certs/icici
+      - certs-sbi:/certs/sbi
+      - certs-client:/certs/client
 
   gateway:
     <<: *common
@@ -27,7 +35,7 @@ services:
     ports:
       - "50052:50052"
     volumes:
-      - certs:/certs:ro
+      - certs-gateway:/certs:ro
       - gateway-data:/data
 
   hdfc:
@@ -37,7 +45,7 @@ services:
       <<: *env
       PG_BANK_HOST: hdfc
     volumes:
-      - certs:/certs:ro
+      - certs-hdfc:/certs:ro
       - hdfc-data:/data
 
   icici:
@@ -47,7 +55,7 @@ services:
       <<: *env
       PG_BANK_HOST: icici
     volumes:
-      - certs:/certs:ro
+      - certs-icici:/certs:ro
       - icici-data:/data
 
   sbi:
@@ -57,7 +65,7 @@ services:
       <<: *env
       PG_BANK_HOST: sbi
     volumes:
-      - certs:/certs:ro
+      - certs-sbi:/certs:ro
       - sbi-data:/data
 
   client:
@@ -69,9 +77,16 @@ services:
     environment:
       <<: *env
       PG_OFFLINE_QUEUE: /tmp/offline_payments.json
+    volumes:
+      - certs-client:/certs:ro
 
 volumes:
-  certs:
+  certs-ca:
+  certs-gateway:
+  certs-hdfc:
+  certs-icici:
+  certs-sbi:
+  certs-client:
   gateway-data:
   hdfc-data:
   icici-data:
