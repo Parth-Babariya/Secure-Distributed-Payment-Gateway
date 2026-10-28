@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Check generated protobuf code is up to date
+        run: |
+          python -m grpc_tools.protoc -Iprotofiles --python_out=protofiles --grpc_python_out=protofiles protofiles/bank.proto protofiles/payment_gateway.proto
+          git diff --exit-code protofiles
+      - run: pytest -q
+      - name: Chaos demo (processes killed mid-payment, then audited)
+        run: python scripts/chaos_demo.py --seconds 30
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up --build -d
+      - name: Wait for banks to register
+        run: |
+          for i in $(seq 1 30); do
+            [ "$(docker compose logs gateway | grep -c 'Registered bank')" -ge 3 ] && exit 0
+            sleep 2
+          done
+          docker compose logs; exit 1
+      - if: always()
+        run: docker compose down -v

@@ -1,0 +1,78 @@
+# Gateway + three banks, each with its own mTLS identity and durable volume.
+#   docker compose up --build -d
+#   docker compose run --rm client
+x-common: &common
+  build: .
+  image: secure-payment-gateway
+  volumes:
+    - certs:/certs:ro
+  environment: &env
+    PG_GATEWAY_ADDRESS: gateway:50052
+    PG_JWT_SECRET: ${PG_JWT_SECRET:-change-me-to-a-long-random-secret-in-production}
+  depends_on:
+    certs:
+      condition: service_completed_successfully
+
+services:
+  certs:
+    build: .
+    image: secure-payment-gateway
+    command: python /app/scripts/gen_certs.py --out /certs
+    volumes:
+      - certs:/certs
+
+  gateway:
+    <<: *common
+    command: python payment_gateway.py
+    ports:
+      - "50052:50052"
+    volumes:
+      - certs:/certs:ro
+      - gateway-data:/data
+
+  hdfc:
+    <<: *common
+    command: python bank_server.py HDFC 60051
+    environment:
+      <<: *env
+      PG_BANK_HOST: hdfc
+    volumes:
+      - certs:/certs:ro
+      - hdfc-data:/data
+
+  icici:
+    <<: *common
+    command: python bank_server.py ICICI 60052
+    environment:
+      <<: *env
+      PG_BANK_HOST: icici
+    volumes:
+      - certs:/certs:ro
+      - icici-data:/data
+
+  sbi:
+    <<: *common
+    command: python bank_server.py SBI 60053
+    environment:
+      <<: *env
+      PG_BANK_HOST: sbi
+    volumes:
+      - certs:/certs:ro
+      - sbi-data:/data
+
+  client:
+    <<: *common
+    command: python /app/client/client.py
+    profiles: ["client"]
+    stdin_open: true
+    tty: true
+    environment:
+      <<: *env
+      PG_OFFLINE_QUEUE: /tmp/offline_payments.json
+
+volumes:
+  certs:
+  gateway-data:
+  hdfc-data:
+  icici-data:
+  sbi-data:

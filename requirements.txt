@@ -1,0 +1,4 @@
+grpcio==1.85.0
+protobuf==7.36.2
+PyJWT==2.15.1
+cryptography==50.0.2
