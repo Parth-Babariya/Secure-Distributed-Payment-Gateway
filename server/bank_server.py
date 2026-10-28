@@ -1,360 +1,299 @@
+"""Bank server: a two-phase-commit participant backed by a SQLite ledger.
 
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'protofiles')))
-import grpc
-from concurrent import futures
+Every vote and decision is written to SQLite before the RPC returns, so a bank
+that crashes after voting yes still honours the coordinator's decision when it
+restarts.
+
+Usage: python bank_server.py <BANK_NAME> <PORT>
+"""
 import json
+import logging
+import os
+import sys
+import threading
+import time
+from concurrent import futures
+
+import grpc
+
+import config
 import bank_pb2
 import bank_pb2_grpc
-import time
-import logging
-# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'protofiles')))
 import payment_gateway_pb2
 import payment_gateway_pb2_grpc
+from interceptor import LoggingInterceptor, PeerIdentityInterceptor
+from storage import SQLiteStore
+from tls import secure_channel, server_credentials
 
-# Configure logging
-logging.basicConfig(
-    filename="banktransactions.log",
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+log = logging.getLogger("bank")
+
+DEBIT, CREDIT = "DEBIT", "CREDIT"
+OPERATIONS = {bank_pb2.DEBIT: DEBIT, bank_pb2.CREDIT: CREDIT}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS accounts (
+    account_number TEXT PRIMARY KEY,
+    balance_paise INTEGER NOT NULL CHECK (balance_paise >= 0)
+);
+CREATE TABLE IF NOT EXISTS ledger (
+    transaction_id TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('DEBIT', 'CREDIT')),
+    account_number TEXT,
+    amount_paise INTEGER,
+    state TEXT NOT NULL CHECK (state IN ('PREPARED', 'COMMITTED', 'ABORTED')),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (transaction_id, operation)
+);
+"""
 
 
-PAYMENT_GATEWAY_ADDRESS = "localhost:50052"
+class BankLedger(SQLiteStore):
+    """Durable account balances and per-transaction 2PC state.
 
-def register_bank(bank_name, port):
-    """Registers the bank with the Payment Gateway with retries until successful."""
-    RETRY_DELAY = 5  # Delay between retry attempts in seconds
+    Each method runs in one SQLite write transaction (BEGIN IMMEDIATE), which
+    serialises the check-then-update steps across threads, so two concurrent
+    debits can never both pass the funds check.
+    """
 
-    # Load SSL/TLS certificates (done once, outside the retry loop)
-    try:
-        bank_key_path = f"../certs/bank/{bank_name.lower()}.key"  # Example: hdfc.key
-        bank_cert_path = f"../certs/bank/{bank_name.lower()}.crt"  # Example: hdfc.crt
-        ca_cert_path = "../certs/ca/ca.crt"
+    def __init__(self, db_path, seed_accounts=None):
+        super().__init__(db_path, SCHEMA)
+        if seed_accounts and not self.query("SELECT 1 FROM accounts LIMIT 1"):
+            with self.transaction() as db:
+                db.executemany(
+                    "INSERT INTO accounts VALUES (?, ?)",
+                    [(acct, int(paise)) for acct, paise in seed_accounts.items()],
+                )
 
-        with open(bank_key_path, "rb") as f:
-            private_key = f.read()
-        with open(bank_cert_path, "rb") as f:
-            certificate_chain = f.read()
-        with open(ca_cert_path, "rb") as f:
-            root_certificates = f.read()
-    except Exception as e:
-        print(f"❌ Failed to load certificates: {str(e)}")
-        logging.error(f"Failed to load certificates: {str(e)}")
-        raise  # Exit if certificates cannot be loaded, as this is a fatal error
+    @staticmethod
+    def _reserved(db, account):
+        row = db.execute(
+            "SELECT COALESCE(SUM(amount_paise), 0) FROM ledger "
+            "WHERE account_number = ? AND operation = 'DEBIT' AND state = 'PREPARED'",
+            (account,),
+        ).fetchone()
+        return row[0]
 
-    bank_port = int(port)  # Ensure it's stored as an integer
+    def balance(self, account):
+        """Return (balance, available) or None if the account does not exist."""
+        with self.transaction() as db:
+            row = db.execute("SELECT balance_paise FROM accounts WHERE account_number = ?", (account,)).fetchone()
+            if row is None:
+                return None
+            return row[0], row[0] - self._reserved(db, account)
 
-    # Establish credentials (done once, outside the retry loop)
-    credentials = grpc.ssl_channel_credentials(
-        root_certificates=root_certificates,
-        private_key=private_key,
-        certificate_chain=certificate_chain
-    )
+    def prepare(self, txn_id, operation, account, amount):
+        """Phase 1. Returns (vote_commit, message)."""
+        if amount <= 0:
+            return False, "Amount must be positive"
+        with self.transaction() as db:
+            existing = db.execute(
+                "SELECT account_number, amount_paise, state FROM ledger WHERE transaction_id = ? AND operation = ?",
+                (txn_id, operation),
+            ).fetchone()
+            if existing is not None:
+                # A retried prepare: repeat the original vote.
+                same = existing[0] == account and existing[1] == amount
+                if existing[2] in ("PREPARED", "COMMITTED") and same:
+                    return True, "Already prepared"
+                return False, f"Transaction already {existing[2].lower()}"
 
-    options = [
-        ('grpc.max_receive_message_length', 10 * 1024 * 1024),
-        ('grpc.max_send_message_length', 10 * 1024 * 1024),
-        ('grpc.keepalive_time_ms', 30000),
-        ('grpc.keepalive_timeout_ms', 10000)
-    ]
+            row = db.execute("SELECT balance_paise FROM accounts WHERE account_number = ?", (account,)).fetchone()
+            if row is None:
+                return False, f"Unknown account {account}"
+            if operation == DEBIT and row[0] - self._reserved(db, account) < amount:
+                return False, "Insufficient funds"
 
-    # Retry loop for gRPC connection and registration
-    while True:
-        try:
-            # Create a new channel for each attempt
-            channel = grpc.secure_channel("localhost:50052", credentials, options=options)
-            print("channel created")
-            stub = payment_gateway_pb2_grpc.PaymentGatewayStub(channel)
+            db.execute(
+                "INSERT INTO ledger VALUES (?, ?, ?, ?, 'PREPARED', ?)",
+                (txn_id, operation, account, amount, time.time()),
+            )
+            return True, "Funds reserved" if operation == DEBIT else "Ready to receive funds"
 
-            try:
-                grpc.channel_ready_future(channel).result(timeout=3)  # Wait for connection
-                print("🔄 Secure gRPC connection established.")
-                logging.info("Secure gRPC connection established.")
+    def commit(self, txn_id, operation):
+        """Phase 2 commit. Idempotent. Returns (success, message)."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT account_number, amount_paise, state FROM ledger WHERE transaction_id = ? AND operation = ?",
+                (txn_id, operation),
+            ).fetchone()
+            if row is None:
+                return False, "Unknown transaction"
+            account, amount, state = row
+            if state == "COMMITTED":
+                return True, "Already committed"
+            if state == "ABORTED":
+                return False, "Transaction was aborted"
+            delta = -amount if operation == DEBIT else amount
+            db.execute(
+                "UPDATE accounts SET balance_paise = balance_paise + ? WHERE account_number = ?",
+                (delta, account),
+            )
+            db.execute(
+                "UPDATE ledger SET state = 'COMMITTED', updated_at = ? WHERE transaction_id = ? AND operation = ?",
+                (time.time(), txn_id, operation),
+            )
+            return True, "Committed"
 
-                # Send registration request
-                request = payment_gateway_pb2.RegisterBankRequest(bank_name=bank_name, bank_port=bank_port)
-                print("🔄 Request sent")
-                response = stub.RegisterBank(request)
-                print("✅ Response received")
+    def abort(self, txn_id, operation):
+        """Phase 2 abort. Idempotent. Returns (success, message)."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT state FROM ledger WHERE transaction_id = ? AND operation = ?",
+                (txn_id, operation),
+            ).fetchone()
+            if row is None:
+                # Leave a tombstone so a delayed prepare for this transaction
+                # arriving after the abort is refused.
+                db.execute(
+                    "INSERT INTO ledger VALUES (?, ?, NULL, NULL, 'ABORTED', ?)",
+                    (txn_id, operation, time.time()),
+                )
+                return True, "Aborted (never prepared)"
+            if row[0] == "COMMITTED":
+                return False, "Transaction already committed"
+            db.execute(
+                "UPDATE ledger SET state = 'ABORTED', updated_at = ? WHERE transaction_id = ? AND operation = ?",
+                (time.time(), txn_id, operation),
+            )
+            return True, "Aborted"
 
-                if response.success:
-                    print(f"✅ Successfully registered {bank_name} on port {bank_port} with Payment Gateway.")
-                    logging.info(f"Successfully registered {bank_name} on port {bank_port} with Payment Gateway.")
-                    channel.close()  # Clean up the channel
-                    return  # Exit on successful registration
-                else:
-                    print(f"⚠️ {bank_name} registration failed: {response.message}")
-                    logging.warning(f"{bank_name} registration failed: {response.message}")
+    def total_balance(self):
+        return self.query("SELECT COALESCE(SUM(balance_paise), 0) FROM accounts")[0][0]
 
-            except grpc.FutureTimeoutError:
-                print("❌ Failed to connect: Payment Gateway is down.")
-                logging.error("Failed to connect: Payment Gateway is down.")
-            
-            channel.close()  # Clean up the channel before retrying
-            print(f"🔄 Retrying registration for {bank_name} in {RETRY_DELAY} seconds...")
-            time.sleep(RETRY_DELAY)  # Wait before retrying
-
-        except Exception as e:
-            print(f"❌ Registration attempt failed: {str(e)}")
-            logging.error(f"Registration attempt failed: {str(e)}")
-            time.sleep(RETRY_DELAY)  # Wait before retrying
-        
-
+    def prepared_count(self):
+        return self.query("SELECT COUNT(*) FROM ledger WHERE state = 'PREPARED'")[0][0]
 
 
 class BankService(bank_pb2_grpc.BankServicer):
-    def __init__(self, bank_name):
+    def __init__(self, bank_name, ledger):
         self.bank_name = bank_name
-        self.accounts = self.load_bank_data()
-        # ✅ Register the bank with Payment Gateway at startup
-        print("before register_bank")
-        register_bank(bank_name, port)
-        # Dictionary to store pending transactions
-        self.pending_transactions = {}
-        # Track account locks
-        self.account_locks = {}
+        self.ledger = ledger
+        # Fault injection for tests and the chaos demo: method name -> number
+        # of upcoming calls to fail with UNAVAILABLE.
+        self.faults = {}
+        self._faults_lock = threading.Lock()
 
-    def load_bank_data(self):
-        """Load account balances for the given bank from bank_data.json."""
-        with open("bank_data.json", "r") as f:
-            data = json.load(f)
-        return data.get(self.bank_name, {})
-    
-    def save_bank_data(self):
-        """Save the current account balances to bank_data.json."""
-        with open("bank_data.json", "r") as f:
-            data = json.load(f)
-        
-        data[self.bank_name] = self.accounts
-        
-        with open("bank_data.json", "w") as f:
-            json.dump(data, f, indent=4)
+    def _maybe_fail(self, method, context):
+        with self._faults_lock:
+            remaining = self.faults.get(method, 0)
+            if remaining <= 0:
+                return
+            self.faults[method] = remaining - 1
+        context.abort(grpc.StatusCode.UNAVAILABLE, f"Injected failure in {method}")
 
+    @staticmethod
+    def _operation(request, context):
+        operation = OPERATIONS.get(request.operation)
+        if operation is None:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Operation must be DEBIT or CREDIT")
+        return operation
 
     def GetBalance(self, request, context):
-        """Returns the balance of an account."""
-        account = request.account_number
-        print("account", account)
-        balance = self.accounts.get(account, 0.0)
-        return bank_pb2.BalanceResponse(balance=balance)
-    
-    def ProcessTransaction(self, request, context):
-        """Legacy method - still supported but 2PC is recommended."""
-        logging.warning(f"⚠️ Legacy transaction processing for {request.from_account} -> {request.to_account}")
-
-        # ✅ Step 1: Check if this is a credit transaction (funds coming from outside)
-        if request.from_account == "SYSTEM":
-            if request.to_account not in self.accounts:
-                return bank_pb2.TransactionResponse(success=False, message="Invalid Receiver Account")
-
-            self.accounts[request.to_account] += request.amount  # Credit the amount
-            self.save_bank_data()
-            return bank_pb2.TransactionResponse(success=True, message="Funds credited successfully")
-
-        # ✅ Step 2: Deduct funds from sender's account (existing logic)
-        if request.from_account not in self.accounts:
-            return bank_pb2.TransactionResponse(success=False, message="Invalid Sender Account")
-
-        if self.accounts[request.from_account] < request.amount:
-            return bank_pb2.TransactionResponse(success=False, message="Insufficient funds")
-
-        self.accounts[request.from_account] -= request.amount  # Deduct funds
-        self.save_bank_data()
-
-        return bank_pb2.TransactionResponse(success=True, message="Amount deducted, waiting for receiver bank")
+        result = self.ledger.balance(request.account_number)
+        if result is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, "Unknown account")
+        balance, available = result
+        return bank_pb2.BalanceResponse(balance_paise=balance, available_paise=available)
 
     def PrepareTransaction(self, request, context):
-        """Phase 1: Prepare for transaction by checking and locking funds."""
-        transaction_id = request.transaction_id
-        account_number = request.account_number
-        amount = request.amount
-        operation = request.operation  # "debit" or "credit"
-        
-        is_debit = (operation == "debit")
-        
-        logging.info(f"🔒 Preparing transaction {transaction_id}: {'debit from' if is_debit else 'credit to'} {account_number} for ${amount}")
-        
-        # Check if this is a credit transaction (receiver bank)
-        if not is_debit:
-            # For receiving bank, check if account exists
-            if account_number not in self.accounts:
-                return bank_pb2.PrepareResponse(
-                    success=False,
-                    message="Invalid receiver account"
-                )
-                
-            # Store the pending transaction
-            self.pending_transactions[(transaction_id, operation)] = {
-                'type': 'credit',
-                'account': account_number,
-                'amount': amount,
-                'timestamp': time.time()
-            }
-            
-            return bank_pb2.PrepareResponse(
-                success=True,
-                message="Ready to receive funds"
-            )
-            
-        # For sending bank (debit operation), check if there are sufficient funds
-        if account_number not in self.accounts:
-            return bank_pb2.PrepareResponse(
-                success=False,
-                message="Invalid sender account"
-            )
-            
-        if self.accounts[account_number] < amount:
-            return bank_pb2.PrepareResponse(
-                success=False,
-                message="Insufficient funds"
-            )
-            
-        # Check if the account is already locked by another transaction
-        if account_number in self.account_locks and self.account_locks[account_number] != transaction_id:
-            return bank_pb2.PrepareResponse(
-                success=False,
-                message="Account locked by another transaction"
-            )
-            
-        # Lock the funds
-        self.account_locks[account_number] = transaction_id
-        
-        # Store the pending transaction
-        self.pending_transactions[(transaction_id, operation)] = {
-            'type': 'debit',
-            'account': account_number,
-            'amount': amount,
-            'timestamp': time.time()
-        }
-        
-        return bank_pb2.PrepareResponse(
-            success=True,
-            message="Funds locked successfully"
+        self._maybe_fail("prepare", context)
+        operation = self._operation(request, context)
+        vote, message = self.ledger.prepare(
+            request.transaction_id, operation, request.account_number, request.amount_paise
         )
-        
+        log.info("[%s] prepare %s %s -> %s (%s)", self.bank_name, request.transaction_id, operation,
+                 "YES" if vote else "NO", message)
+        return bank_pb2.PrepareResponse(vote_commit=vote, message=message)
+
     def CommitTransaction(self, request, context):
-        """Phase 2: Commit the transaction after all participants are prepared."""
-        transaction_id = request.transaction_id
-        account_number = request.account_number
-        amount = request.amount
-        operation = request.operation  # "debit" or "credit"
-        
-        logging.info(f"✅ Committing transaction {transaction_id} for {operation} operation")
-        
-        # Check if this transaction exists in our pending transactions
-        if (transaction_id, operation) not in self.pending_transactions:
-            return bank_pb2.CommitResponse(
-                success=False,
-                message=f"Unknown transaction: {transaction_id}"
-            )
-            
-        transaction = self.pending_transactions[(transaction_id, operation)]
-        
-        # Verify that the account number matches the one in pending transaction
-        if transaction['account'] != account_number:
-            return bank_pb2.CommitResponse(
-                success=False,
-                message=f"Account mismatch: {account_number} vs {transaction['account']}"
-            )
-            
-        # Process based on operation type
-        if operation == "debit":
-            # Actually deduct the funds
-            self.accounts[account_number] -= amount
-            
-            # Release the lock
-            if account_number in self.account_locks:
-                del self.account_locks[account_number]
-                
-        elif operation == "credit":
-            # Credit the funds
-            self.accounts[account_number] += amount
-            
-        # Save the updated account data
-        self.save_bank_data()
-            
-        # Remove from pending transactions
-        del self.pending_transactions[(transaction_id, operation)]
-        
-        return bank_pb2.CommitResponse(
-            success=True,
-            message="Transaction committed successfully"
-        )
-    
+        self._maybe_fail("commit", context)
+        operation = self._operation(request, context)
+        ok, message = self.ledger.commit(request.transaction_id, operation)
+        log.info("[%s] commit %s %s -> %s", self.bank_name, request.transaction_id, operation, message)
+        return bank_pb2.DecisionResponse(success=ok, message=message)
+
     def AbortTransaction(self, request, context):
-        """Phase 2 (Abort): Release locks and cancel the transaction."""
-        transaction_id = request.transaction_id
-        account_number = request.account_number
-        operation = request.operation  # "debit" or "credit"
-        
-        logging.info(f"❌ Aborting transaction {transaction_id} for {operation} operation")
-        
-        # Check if this transaction exists in our pending transactions
-        if (transaction_id, operation) not in self.pending_transactions:
-            return bank_pb2.AbortResponse(
-                success=True,
-                message=f"Unknown transaction: {transaction_id}, nothing to abort"
-            )
-            
-        transaction = self.pending_transactions[(transaction_id, operation)]
-        
-        # If it's a debit transaction, release the account lock
-        if operation == "debit" and account_number in self.account_locks:
-            del self.account_locks[account_number]
-        
-        # Remove from pending transactions
-        del self.pending_transactions[(transaction_id, operation)]
-        
-        return bank_pb2.AbortResponse(
-            success=True,
-            message="Transaction aborted successfully"
-        )
+        self._maybe_fail("abort", context)
+        operation = self._operation(request, context)
+        ok, message = self.ledger.abort(request.transaction_id, operation)
+        log.info("[%s] abort %s %s -> %s", self.bank_name, request.transaction_id, operation, message)
+        return bank_pb2.DecisionResponse(success=ok, message=message)
+
+
+def register_with_gateway(bank_name, host, port, gateway_address, cert_dir, stop_event,
+                          retry_delay=2.0):
+    """Register this bank with the gateway, retrying until it succeeds."""
+    channel = secure_channel(gateway_address, cert_dir, bank_name.lower())
+    stub = payment_gateway_pb2_grpc.PaymentGatewayStub(channel)
+    request = payment_gateway_pb2.RegisterBankRequest(bank_name=bank_name, bank_port=port, bank_host=host)
+    try:
+        while not stop_event.is_set():
+            try:
+                response = stub.RegisterBank(request, timeout=5)
+                if response.success:
+                    log.info("Registered %s at %s:%s with the gateway", bank_name, host, port)
+                    return True
+                log.warning("Registration refused: %s", response.message)
+            except grpc.RpcError as e:
+                log.warning("Gateway unreachable (%s); retrying in %.0fs", e.code().name, retry_delay)
+            stop_event.wait(retry_delay)
+        return False
+    finally:
+        channel.close()
+
+
+def load_seed_accounts(bank_name, seed_file=None):
+    """Opening balances (rupees in the JSON file) converted to paise."""
+    with open(seed_file or config.BANK_SEED_FILE, "r", encoding="utf-8") as f:
+        accounts = json.load(f).get(bank_name, {})
+    return {acct: round(float(rupees) * 100) for acct, rupees in accounts.items()}
+
+
+def build_server(bank_name, port, *, cert_dir=None, data_dir=None, seed_accounts=None,
+                 bind_host="[::]"):
+    """Create (server, service, bound_port) for a bank without starting it."""
+    cert_dir = cert_dir or config.CERT_DIR
+    data_dir = data_dir or config.DATA_DIR
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if seed_accounts is None:
+        seed_accounts = load_seed_accounts(bank_name)
+
+    ledger = BankLedger(data_dir / f"{bank_name.lower()}.db", seed_accounts)
+    service = BankService(bank_name, ledger)
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=16),
+        interceptors=[LoggingInterceptor(), PeerIdentityInterceptor({config.GATEWAY_CN})],
+    )
+    bank_pb2_grpc.add_BankServicer_to_server(service, server)
+    bound_port = server.add_secure_port(f"{bind_host}:{port}", server_credentials(cert_dir, bank_name.lower()))
+    return server, service, bound_port
+
 
 def serve(bank_name, port):
-    """Start a secure bank server with TLS."""
-    cert_path = f'../certs/bank/{bank_name.lower()}.crt'
-    key_path = f'../certs/bank/{bank_name.lower()}.key'
-
-    with open(key_path, 'rb') as f:
-        private_key = f.read()
-    with open(cert_path, 'rb') as f:
-        certificate_chain = f.read()
-    with open('../certs/ca/ca.crt', 'rb') as f:
-        root_certificates = f.read()
-
-    server_credentials = grpc.ssl_server_credentials(
-        [(private_key, certificate_chain)],
-        root_certificates=root_certificates,
-        require_client_auth=True
-    )
-
-
-    # Create a gRPC server
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    bank_pb2_grpc.add_BankServicer_to_server(BankService(bank_name), server)
-
-    # Start the secure server
-    server.add_secure_port(f"[::]:{port}", server_credentials)
-    logging.info(f"port={port}")
-    logging.info(f"🚀 Secure Bank Server '{bank_name}' started on port {port} with 2PC support")
-
-    print("port=" + port)
-    print(f"🚀 Secure Bank Server '{bank_name}' started on port {port}")
-
+    server, service, bound_port = build_server(bank_name, port)
     server.start()
-    server.wait_for_termination()
+    log.info("Bank %s listening on port %s (mTLS, gateway-only)", bank_name, bound_port)
+
+    stop = threading.Event()
+    host = os.environ.get("PG_BANK_HOST", "localhost")
+    threading.Thread(
+        target=register_with_gateway,
+        args=(bank_name, host, bound_port, config.GATEWAY_ADDRESS, config.CERT_DIR, stop),
+        daemon=True,
+    ).start()
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        server.stop(grace=2)
+        service.ledger.close()
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python bank_server.py <BANK_NAME> <PORT>")
         sys.exit(1)
-
-    bank_name = sys.argv[1]
-    port = sys.argv[2]
-    # ✅ Register the bank before starting the server
-    # register_bank(bank_name,port)
-    serve(bank_name, port)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    serve(sys.argv[1].upper(), int(sys.argv[2]))
