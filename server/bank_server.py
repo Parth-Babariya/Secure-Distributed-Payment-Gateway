@@ -50,19 +50,21 @@ CREATE TABLE IF NOT EXISTS ledger (
 class BankLedger(SQLiteStore):
     """Durable account balances and per-transaction 2PC state.
 
-    Each method runs in one SQLite write transaction (BEGIN IMMEDIATE), which
-    serialises the check-then-update steps across threads, so two concurrent
-    debits can never both pass the funds check.
+    Each write runs as one step on the store's single writer (see storage.py),
+    which serialises the check-then-update steps across threads, so two
+    concurrent debits can never both pass the funds check. Concurrent votes
+    and decisions share one fsync through group commit.
     """
 
     def __init__(self, db_path, seed_accounts=None):
         super().__init__(db_path, SCHEMA)
         if seed_accounts and not self.query("SELECT 1 FROM accounts LIMIT 1"):
-            with self.transaction() as db:
+            def step(db):
                 db.executemany(
                     "INSERT INTO accounts VALUES (?, ?)",
                     [(acct, int(paise)) for acct, paise in seed_accounts.items()],
                 )
+            self.write(step)
 
     @staticmethod
     def _reserved(db, account):
@@ -75,17 +77,18 @@ class BankLedger(SQLiteStore):
 
     def balance(self, account):
         """Return (balance, available) or None if the account does not exist."""
-        with self.transaction() as db:
+        def step(db):
             row = db.execute("SELECT balance_paise FROM accounts WHERE account_number = ?", (account,)).fetchone()
             if row is None:
                 return None
             return row[0], row[0] - self._reserved(db, account)
+        return self.read(step)
 
     def prepare(self, txn_id, operation, account, amount):
         """Phase 1. Returns (vote_commit, message)."""
         if amount <= 0:
             return False, "Amount must be positive"
-        with self.transaction() as db:
+        def step(db):
             existing = db.execute(
                 "SELECT account_number, amount_paise, state FROM ledger WHERE transaction_id = ? AND operation = ?",
                 (txn_id, operation),
@@ -108,10 +111,11 @@ class BankLedger(SQLiteStore):
                 (txn_id, operation, account, amount, time.time()),
             )
             return True, "Funds reserved" if operation == DEBIT else "Ready to receive funds"
+        return self.write(step)
 
     def commit(self, txn_id, operation):
         """Phase 2 commit. Idempotent. Returns (success, message)."""
-        with self.transaction() as db:
+        def step(db):
             row = db.execute(
                 "SELECT account_number, amount_paise, state FROM ledger WHERE transaction_id = ? AND operation = ?",
                 (txn_id, operation),
@@ -133,10 +137,11 @@ class BankLedger(SQLiteStore):
                 (time.time(), txn_id, operation),
             )
             return True, "Committed"
+        return self.write(step)
 
     def abort(self, txn_id, operation):
         """Phase 2 abort. Idempotent. Returns (success, message)."""
-        with self.transaction() as db:
+        def step(db):
             row = db.execute(
                 "SELECT state FROM ledger WHERE transaction_id = ? AND operation = ?",
                 (txn_id, operation),
@@ -156,6 +161,7 @@ class BankLedger(SQLiteStore):
                 (time.time(), txn_id, operation),
             )
             return True, "Aborted"
+        return self.write(step)
 
     def total_balance(self):
         return self.query("SELECT COALESCE(SUM(balance_paise), 0) FROM accounts")[0][0]

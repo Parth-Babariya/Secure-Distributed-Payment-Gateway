@@ -84,7 +84,8 @@ class CoordinatorLog(SQLiteStore):
         """Insert a new PREPARING payment. Returns the existing row instead if
         the transaction id is already in use."""
         now = time.time()
-        with self.transaction() as db:
+
+        def insert(db):
             existing = db.execute("SELECT * FROM payments WHERE transaction_id = ?",
                                   (payment["transaction_id"],)).fetchone()
             if existing is not None:
@@ -96,6 +97,7 @@ class CoordinatorLog(SQLiteStore):
             )
             return True, db.execute("SELECT * FROM payments WHERE transaction_id = ?",
                                     (payment["transaction_id"],)).fetchone()
+        return self.write(insert)
 
     def get_payment(self, txn_id):
         rows = self.query("SELECT * FROM payments WHERE transaction_id = ?", (txn_id,))
@@ -104,13 +106,11 @@ class CoordinatorLog(SQLiteStore):
     def transition(self, txn_id, from_states, to_state, message=None):
         """Compare-and-set the status. Returns True if this call made the change."""
         placeholders = ",".join("?" * len(from_states))
-        with self.transaction() as db:
-            cursor = db.execute(
-                f"UPDATE payments SET status = ?, message = COALESCE(?, message), updated_at = ? "
-                f"WHERE transaction_id = ? AND status IN ({placeholders})",
-                (to_state, message, time.time(), txn_id, *from_states),
-            )
-            return cursor.rowcount == 1
+        return self.write(lambda db: db.execute(
+            f"UPDATE payments SET status = ?, message = COALESCE(?, message), updated_at = ? "
+            f"WHERE transaction_id = ? AND status IN ({placeholders})",
+            (to_state, message, time.time(), txn_id, *from_states),
+        ).rowcount == 1)
 
     def in_doubt(self, prepare_timeout):
         """Payments the recovery worker must drive forward."""
@@ -129,12 +129,11 @@ class CoordinatorLog(SQLiteStore):
 
     # -- bank directory ----------------------------------------------------
     def upsert_bank(self, name, host, port):
-        with self.transaction() as db:
-            db.execute(
-                "INSERT INTO banks VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE "
-                "SET host = excluded.host, port = excluded.port, updated_at = excluded.updated_at",
-                (name, host, port, time.time()),
-            )
+        self.write(lambda db: db.execute(
+            "INSERT INTO banks VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE "
+            "SET host = excluded.host, port = excluded.port, updated_at = excluded.updated_at",
+            (name, host, port, time.time()),
+        ))
 
     def get_bank(self, name):
         rows = self.query("SELECT host, port FROM banks WHERE name = ?", (name,))
@@ -142,18 +141,20 @@ class CoordinatorLog(SQLiteStore):
 
     # -- token revocation (used by auth.TokenManager) ----------------------
     def revoke(self, jti, expires_at):
-        with self.transaction() as db:
+        def insert(db):
             db.execute("DELETE FROM revoked_tokens WHERE expires_at < ?", (time.time(),))
             db.execute("INSERT OR IGNORE INTO revoked_tokens VALUES (?, ?)", (jti, expires_at))
+        self.write(insert)
 
     def is_revoked(self, jti):
         return bool(self.query("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)))
 
     # -- failed logins (used by auth.LoginThrottle) ------------------------
     def record_login_failure(self, keys, at, window):
-        with self.transaction() as db:
+        def insert(db):
             db.execute("DELETE FROM login_failures WHERE at < ?", (at - window,))
             db.executemany("INSERT INTO login_failures VALUES (?, ?)", [(key, at) for key in keys])
+        self.write(insert)
 
     def login_failures(self, key, since):
         """Return (count, latest timestamp) of failures for key since `since`."""
@@ -161,8 +162,7 @@ class CoordinatorLog(SQLiteStore):
         return row[0], row[1] or 0.0
 
     def clear_login_failures(self, key):
-        with self.transaction() as db:
-            db.execute("DELETE FROM login_failures WHERE key = ?", (key,))
+        self.write(lambda db: db.execute("DELETE FROM login_failures WHERE key = ?", (key,)))
 
 
 class BankUnavailable(Exception):
