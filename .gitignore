@@ -1,0 +1,14 @@
+# Generated secrets: run scripts/gen_certs.py
+certs/
+# Runtime state
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+client/offline_payments.json
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
