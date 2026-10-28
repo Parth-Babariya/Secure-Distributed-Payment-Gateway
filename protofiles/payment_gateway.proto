@@ -1,10 +1,11 @@
 syntax = "proto3";
 
 service PaymentGateway {
-    rpc RegisterBank(RegisterBankRequest) returns (RegisterBankResponse);
+    rpc RegisterBank (RegisterBankRequest) returns (RegisterBankResponse);
     rpc AuthenticateClient (AuthRequest) returns (AuthResponse);
     rpc CheckBalance (BalanceRequest) returns (BalanceResponse);
     rpc ProcessPayment (PaymentRequest) returns (PaymentResponse);
+    rpc GetPaymentStatus (PaymentStatusRequest) returns (PaymentResponse);
     rpc ViewTransactionHistory (TransactionHistoryRequest) returns (TransactionHistoryResponse);
     rpc LogoutClient (LogoutRequest) returns (LogoutResponse);
 }
@@ -12,10 +13,11 @@ service PaymentGateway {
 message RegisterBankRequest {
     string bank_name = 1;
     int32 bank_port = 2;
+    string bank_host = 3;  // defaults to localhost when empty
 }
 
 message RegisterBankResponse {
-    bool success=1;
+    bool success = 1;
     string message = 2;
 }
 
@@ -25,31 +27,40 @@ message AuthRequest {
 }
 
 message AuthResponse {
-  bool authenticated = 1;
-  string token = 2;
-  string message = 3;  // Add this field for detailed responses
+    bool authenticated = 1;
+    string token = 2;
+    string message = 3;
 }
 
-// Balance Request & Response
 message BalanceRequest {
-    string bank_name = 1;  // New field to specify which bank's balance to check
-}
-message BalanceResponse {
-    double balance = 1;
+    string bank_name = 1;
 }
 
+message BalanceResponse {
+    int64 balance_paise = 1;
+    int64 available_paise = 2;
+}
+
+// Amounts are integer paise: floating point is never used for money.
 message PaymentRequest {
-    string transaction_id = 1;
-    string sender_bank_name=2;
-    string receiver_username=3;
-    string receiver_bank_name = 4;  // ✅ Sender's bank name (required)
-    double amount = 5;
+    string transaction_id = 1;  // client-generated idempotency key
+    string sender_bank_name = 2;
+    string receiver_username = 3;
+    string receiver_bank_name = 4;
+    int64 amount_paise = 5;
 }
 
 message PaymentResponse {
     bool success = 1;
     string message = 2;
-    string transaction_id = 3; // adding this field
+    string transaction_id = 3;
+    // PREPARING, COMMITTING, COMMITTED, ABORTING or ABORTED. COMMITTING means
+    // the commit decision is durable and settlement is still being retried.
+    string status = 4;
+}
+
+message PaymentStatusRequest {
+    string transaction_id = 1;
 }
 
 message LogoutRequest {}
@@ -59,21 +70,19 @@ message LogoutResponse {
     string message = 2;
 }
 
-
-message TransactionHistoryRequest {
-    // The request doesn't need parameters since the server extracts user info from metadata.
-}
+message TransactionHistoryRequest {}
 
 message Transaction {
     string transaction_id = 1;
     string from_bank = 2;
     string to_bank = 3;
-    string from_account_no = 4;  // Will be included only for sender
-    string from_user_id = 5;      // Will be included only for receiver
-    string to_user_id = 6;        // Will be included only for sender
-    double amount = 7;
+    string from_account_no = 4;  // sender's view only
+    string from_user_id = 5;     // receiver's view only
+    string to_user_id = 6;       // sender's view only
+    int64 amount_paise = 7;
     string timestamp = 8;
     string status = 9;
+    string message = 10;
 }
 
 message TransactionHistoryResponse {

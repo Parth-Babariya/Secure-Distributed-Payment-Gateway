@@ -1,26 +1,24 @@
 syntax = "proto3";
 package bank;
 
+// Participant side of the two-phase commit. Only the payment gateway may call
+// these methods (enforced by its mTLS certificate identity).
 service Bank {
-  
-  rpc ProcessTransaction(TransactionRequest) returns (TransactionResponse);
   rpc GetBalance(BalanceRequest) returns (BalanceResponse);
-  
-  // New 2PC methods aligned with payment gateway
+
+  // Phase 1: vote. A yes vote is durable: the bank has reserved the funds
+  // (debit) or validated the account (credit) and will honour either decision.
   rpc PrepareTransaction(PrepareRequest) returns (PrepareResponse);
-  rpc CommitTransaction(CommitRequest) returns (CommitResponse);
-  rpc AbortTransaction(AbortRequest) returns (AbortResponse);
+
+  // Phase 2. Both calls are idempotent so the coordinator can retry them.
+  rpc CommitTransaction(DecisionRequest) returns (DecisionResponse);
+  rpc AbortTransaction(DecisionRequest) returns (DecisionResponse);
 }
 
-message TransactionRequest {
-  string from_account = 1;
-  string to_account = 2;
-  double amount = 3;
-}
-
-message TransactionResponse {
-  bool success = 1;
-  string message = 2;
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  DEBIT = 1;
+  CREDIT = 2;
 }
 
 message BalanceRequest {
@@ -28,44 +26,28 @@ message BalanceRequest {
 }
 
 message BalanceResponse {
-  double balance = 1;
+  int64 balance_paise = 1;    // settled balance
+  int64 available_paise = 2;  // balance minus funds reserved by prepared debits
 }
 
-// New messages for 2PC aligned with payment gateway
 message PrepareRequest {
   string transaction_id = 1;
   string account_number = 2;
-  double amount = 3;
-  string operation = 4;  // "debit" or "credit"
+  int64 amount_paise = 3;
+  Operation operation = 4;
 }
 
 message PrepareResponse {
-  bool success = 1;
+  bool vote_commit = 1;
   string message = 2;
 }
 
-message CommitRequest {
+message DecisionRequest {
   string transaction_id = 1;
-  string account_number = 2;
-  double amount = 3;
-  string operation = 4;  // "debit" or "credit"
+  Operation operation = 2;
 }
 
-message CommitResponse {
-  bool success = 1;
-  string message = 2;
-}
-
-message AbortRequest {
-  string transaction_id = 1;
-  string account_number = 2;
-  double amount = 3;
-  string operation = 4;  // "debit" or "credit"
-}
-
-
-
-message AbortResponse {
+message DecisionResponse {
   bool success = 1;
   string message = 2;
 }

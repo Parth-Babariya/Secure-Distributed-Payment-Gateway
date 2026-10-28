@@ -5,7 +5,7 @@ import warnings
 
 import bank_pb2 as bank__pb2
 
-GRPC_GENERATED_VERSION = '1.70.0'
+GRPC_GENERATED_VERSION = '1.85.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,15 +18,17 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in bank_pb2_grpc.py depends on'
+        + ' but the generated code in bank_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
-class BankStub(object):
-    """Missing associated documentation comment in .proto file."""
+class BankStub:
+    """Participant side of the two-phase commit. Only the payment gateway may call
+    these methods (enforced by its mTLS certificate identity).
+    """
 
     def __init__(self, channel):
         """Constructor.
@@ -34,11 +36,6 @@ class BankStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.ProcessTransaction = channel.unary_unary(
-                '/bank.Bank/ProcessTransaction',
-                request_serializer=bank__pb2.TransactionRequest.SerializeToString,
-                response_deserializer=bank__pb2.TransactionResponse.FromString,
-                _registered_method=True)
         self.GetBalance = channel.unary_unary(
                 '/bank.Bank/GetBalance',
                 request_serializer=bank__pb2.BalanceRequest.SerializeToString,
@@ -51,24 +48,20 @@ class BankStub(object):
                 _registered_method=True)
         self.CommitTransaction = channel.unary_unary(
                 '/bank.Bank/CommitTransaction',
-                request_serializer=bank__pb2.CommitRequest.SerializeToString,
-                response_deserializer=bank__pb2.CommitResponse.FromString,
+                request_serializer=bank__pb2.DecisionRequest.SerializeToString,
+                response_deserializer=bank__pb2.DecisionResponse.FromString,
                 _registered_method=True)
         self.AbortTransaction = channel.unary_unary(
                 '/bank.Bank/AbortTransaction',
-                request_serializer=bank__pb2.AbortRequest.SerializeToString,
-                response_deserializer=bank__pb2.AbortResponse.FromString,
+                request_serializer=bank__pb2.DecisionRequest.SerializeToString,
+                response_deserializer=bank__pb2.DecisionResponse.FromString,
                 _registered_method=True)
 
 
-class BankServicer(object):
-    """Missing associated documentation comment in .proto file."""
-
-    def ProcessTransaction(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
+class BankServicer:
+    """Participant side of the two-phase commit. Only the payment gateway may call
+    these methods (enforced by its mTLS certificate identity).
+    """
 
     def GetBalance(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -77,14 +70,16 @@ class BankServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def PrepareTransaction(self, request, context):
-        """New 2PC methods aligned with payment gateway
+        """Phase 1: vote. A yes vote is durable: the bank has reserved the funds
+        (debit) or validated the account (credit) and will honour either decision.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def CommitTransaction(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Phase 2. Both calls are idempotent so the coordinator can retry them.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -98,11 +93,6 @@ class BankServicer(object):
 
 def add_BankServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'ProcessTransaction': grpc.unary_unary_rpc_method_handler(
-                    servicer.ProcessTransaction,
-                    request_deserializer=bank__pb2.TransactionRequest.FromString,
-                    response_serializer=bank__pb2.TransactionResponse.SerializeToString,
-            ),
             'GetBalance': grpc.unary_unary_rpc_method_handler(
                     servicer.GetBalance,
                     request_deserializer=bank__pb2.BalanceRequest.FromString,
@@ -115,13 +105,13 @@ def add_BankServicer_to_server(servicer, server):
             ),
             'CommitTransaction': grpc.unary_unary_rpc_method_handler(
                     servicer.CommitTransaction,
-                    request_deserializer=bank__pb2.CommitRequest.FromString,
-                    response_serializer=bank__pb2.CommitResponse.SerializeToString,
+                    request_deserializer=bank__pb2.DecisionRequest.FromString,
+                    response_serializer=bank__pb2.DecisionResponse.SerializeToString,
             ),
             'AbortTransaction': grpc.unary_unary_rpc_method_handler(
                     servicer.AbortTransaction,
-                    request_deserializer=bank__pb2.AbortRequest.FromString,
-                    response_serializer=bank__pb2.AbortResponse.SerializeToString,
+                    request_deserializer=bank__pb2.DecisionRequest.FromString,
+                    response_serializer=bank__pb2.DecisionResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -131,35 +121,10 @@ def add_BankServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Bank(object):
-    """Missing associated documentation comment in .proto file."""
-
-    @staticmethod
-    def ProcessTransaction(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/bank.Bank/ProcessTransaction',
-            bank__pb2.TransactionRequest.SerializeToString,
-            bank__pb2.TransactionResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
+class Bank:
+    """Participant side of the two-phase commit. Only the payment gateway may call
+    these methods (enforced by its mTLS certificate identity).
+    """
 
     @staticmethod
     def GetBalance(request,
@@ -230,8 +195,8 @@ class Bank(object):
             request,
             target,
             '/bank.Bank/CommitTransaction',
-            bank__pb2.CommitRequest.SerializeToString,
-            bank__pb2.CommitResponse.FromString,
+            bank__pb2.DecisionRequest.SerializeToString,
+            bank__pb2.DecisionResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -257,8 +222,8 @@ class Bank(object):
             request,
             target,
             '/bank.Bank/AbortTransaction',
-            bank__pb2.AbortRequest.SerializeToString,
-            bank__pb2.AbortResponse.FromString,
+            bank__pb2.DecisionRequest.SerializeToString,
+            bank__pb2.DecisionResponse.FromString,
             options,
             channel_credentials,
             insecure,

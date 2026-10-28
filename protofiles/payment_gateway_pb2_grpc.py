@@ -5,7 +5,7 @@ import warnings
 
 import payment_gateway_pb2 as payment__gateway__pb2
 
-GRPC_GENERATED_VERSION = '1.70.0'
+GRPC_GENERATED_VERSION = '1.85.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,14 +18,14 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in payment_gateway_pb2_grpc.py depends on'
+        + ' but the generated code in payment_gateway_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
-class PaymentGatewayStub(object):
+class PaymentGatewayStub:
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -54,6 +54,11 @@ class PaymentGatewayStub(object):
                 request_serializer=payment__gateway__pb2.PaymentRequest.SerializeToString,
                 response_deserializer=payment__gateway__pb2.PaymentResponse.FromString,
                 _registered_method=True)
+        self.GetPaymentStatus = channel.unary_unary(
+                '/PaymentGateway/GetPaymentStatus',
+                request_serializer=payment__gateway__pb2.PaymentStatusRequest.SerializeToString,
+                response_deserializer=payment__gateway__pb2.PaymentResponse.FromString,
+                _registered_method=True)
         self.ViewTransactionHistory = channel.unary_unary(
                 '/PaymentGateway/ViewTransactionHistory',
                 request_serializer=payment__gateway__pb2.TransactionHistoryRequest.SerializeToString,
@@ -66,7 +71,7 @@ class PaymentGatewayStub(object):
                 _registered_method=True)
 
 
-class PaymentGatewayServicer(object):
+class PaymentGatewayServicer:
     """Missing associated documentation comment in .proto file."""
 
     def RegisterBank(self, request, context):
@@ -88,6 +93,12 @@ class PaymentGatewayServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ProcessPayment(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetPaymentStatus(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -128,6 +139,11 @@ def add_PaymentGatewayServicer_to_server(servicer, server):
                     request_deserializer=payment__gateway__pb2.PaymentRequest.FromString,
                     response_serializer=payment__gateway__pb2.PaymentResponse.SerializeToString,
             ),
+            'GetPaymentStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetPaymentStatus,
+                    request_deserializer=payment__gateway__pb2.PaymentStatusRequest.FromString,
+                    response_serializer=payment__gateway__pb2.PaymentResponse.SerializeToString,
+            ),
             'ViewTransactionHistory': grpc.unary_unary_rpc_method_handler(
                     servicer.ViewTransactionHistory,
                     request_deserializer=payment__gateway__pb2.TransactionHistoryRequest.FromString,
@@ -146,7 +162,7 @@ def add_PaymentGatewayServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class PaymentGateway(object):
+class PaymentGateway:
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
@@ -246,6 +262,33 @@ class PaymentGateway(object):
             target,
             '/PaymentGateway/ProcessPayment',
             payment__gateway__pb2.PaymentRequest.SerializeToString,
+            payment__gateway__pb2.PaymentResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetPaymentStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/PaymentGateway/GetPaymentStatus',
+            payment__gateway__pb2.PaymentStatusRequest.SerializeToString,
             payment__gateway__pb2.PaymentResponse.FromString,
             options,
             channel_credentials,
