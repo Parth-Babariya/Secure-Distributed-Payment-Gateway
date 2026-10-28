@@ -1,556 +1,243 @@
-import grpc
-import sys
-import os
+"""Interactive client for the payment gateway.
+
+Payments made while the gateway is unreachable are queued on disk and sent
+automatically once it is back. Each queued payment keeps its transaction id,
+so a payment that did reach the gateway before the connection dropped is never
+applied twice.
+"""
 import json
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'protofiles')))
-import payment_gateway_pb2
-import payment_gateway_pb2_grpc
-import time
-import uuid
 import logging
-from datetime import datetime
-from threading import Thread, Lock
+import os
+import sys
+import threading
+import uuid
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
-# Constants
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT / "server"))
+
+import grpc  # noqa: E402
+
+import config  # noqa: E402  (also puts protofiles/ on sys.path)
+import payment_gateway_pb2  # noqa: E402
+import payment_gateway_pb2_grpc  # noqa: E402
+from tls import secure_channel  # noqa: E402
+
 MAX_RETRIES = 3
-RETRY_DELAY = 3
-OFFLINE_QUEUE_FILE = "offline_payments.json"
-RECONNECT_INTERVAL = 30  # Check connection every 30 seconds
+RETRY_DELAY = 2
+RPC_TIMEOUT = 10
+RECONNECT_INTERVAL = 10
+OFFLINE_QUEUE_FILE = Path(os.environ.get("PG_OFFLINE_QUEUE", Path(__file__).resolve().parent / "offline_payments.json"))
 
-#Global variables
-jwt_token = None
-stub = None # ✅ Global stub for reuse
-offline_queue = []
-queue_lock = Lock()
-is_online = False
+logging.basicConfig(filename=str(Path(__file__).resolve().parent / "client.log"), level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("client")
 
 
-# Configure logging
-logging.basicConfig(
-    filename="client.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+def rupees(paise):
+    return f"Rs {paise / 100:,.2f}"
 
-def load_offline_queue():
-    """Load pending offline payments from disk."""
-    global offline_queue
+
+def parse_amount(text):
+    """Convert a rupee amount such as '12.50' to integer paise (or None)."""
     try:
-        if os.path.exists(OFFLINE_QUEUE_FILE):
-            with open(OFFLINE_QUEUE_FILE, 'r') as file:
-                offline_queue = json.load(file)
-                if offline_queue:
-                    logging.info(f"Loaded {len(offline_queue)} pending offline payments")
-                    # print(f"📋 Loaded {len(offline_queue)} pending offline payments")
-    except Exception as e:
-        logging.error(f"Failed to load offline queue: {str(e)}")
-        print(f"❌ Failed to load offline queue: {str(e)}")
-        offline_queue = []
+        value = Decimal(text.strip())
+    except InvalidOperation:
+        return None
+    if not value.is_finite() or value <= 0 or value != value.quantize(Decimal("0.01")):
+        return None
+    return int(value * 100)
 
 
-def save_offline_queue():
-    """Save pending offline payments to disk."""
-    try:
-        with open(OFFLINE_QUEUE_FILE, 'w') as file:
-            json.dump(offline_queue, file)
-            logging.info(f"Saved {len(offline_queue)} pending offline payments")
-    except Exception as e:
-        logging.error(f"Failed to save offline queue: {str(e)}")
-        print(f"❌ Failed to save offline queue: {str(e)}")       
+class GatewayClient:
+    def __init__(self, address=config.GATEWAY_ADDRESS, cert_dir=config.CERT_DIR):
+        self.channel = secure_channel(address, cert_dir, config.CLIENT_CN)
+        self.stub = payment_gateway_pb2_grpc.PaymentGatewayStub(self.channel)
+        self.token = None
+        self.queue_lock = threading.Lock()
+        self.offline_queue = self._load_queue()
 
-def authenticate_client(stub, username, password):
-    """Authenticates a client using JWT and retries if the Payment Gateway is down."""
-    global jwt_token, is_online
-   
-   
-        
-    metadata = [("authorization", jwt_token)] if jwt_token else []  # Attach token if available
-    # request = payment_gateway_pb2.AuthRequest(username=username, password=password,metadata=metadata)
-    
-    request = payment_gateway_pb2.AuthRequest(username=username, password=password)
-    print("🔄 Request sent")
+    # -- plumbing ----------------------------------------------------------
+    def _metadata(self):
+        return [("authorization", self.token)] if self.token else []
 
-    attempt = 0
-    while attempt < MAX_RETRIES:
+    def _call(self, method, request):
+        """Call an RPC, retrying while the gateway is unavailable."""
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return method(request, metadata=self._metadata(), timeout=RPC_TIMEOUT)
+            except grpc.RpcError as e:
+                if e.code() not in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED) \
+                        or attempt == MAX_RETRIES:
+                    raise
+                print(f"Gateway unavailable, retrying ({attempt}/{MAX_RETRIES})...")
+                threading.Event().wait(RETRY_DELAY)
+
+    def is_online(self):
         try:
-            response = stub.AuthenticateClient(request,metadata=metadata)
-            print("✅ Response received")
-            is_online = True  # Mark system as online
-
-            if response.authenticated:
-                print(f"✅ Login successful!")
-                jwt_token = response.token
-                logging.info(f"✅ Authentication successful for {username}.")
-                return True
-            else:
-                if response.message == "Already logged in. Please log out first or wait for token expiration.":
-                    print("❌ Login failed! You are already logged in with an active session.")
-                    return False
-                else:
-                    print("❌ Login failed! Invalid username or password.")
-                    return False
-
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNAVAILABLE:
-                attempt += 1
-                print(f"❌ Payment Gateway is down. Retrying in {RETRY_DELAY} seconds... (Attempt {attempt}/{MAX_RETRIES})")
-                time.sleep(RETRY_DELAY)
-                initialize_stub()
-                print("🔄 Retrying authentication...")
-                is_online = False  # Mark system as offline
-            elif e.code() == grpc.StatusCode.UNAUTHENTICATED:
-                print("❌ Authentication failed: Invalid token or credentials.")
-                return False
-            elif e.code() == grpc.StatusCode.INVALID_ARGUMENT:
-                print("❌ Authentication failed: Invalid request format.")
-                return False
-            else:
-                print(f"❌ Authentication failed: {e.code()} - {e.details()}")
-                return False
-
-    print("❌ Authentication failed after multiple attempts. Please check the server.")
-    is_online = False  # Mark system as offline
-    return False         
-
-
-
-def check_balance(stub,bank_name):
-    """Checks balance with retries if Payment Gateway is down."""
-    global is_online
-    
-    if jwt_token is None:
-        print("❌ Please authenticate first.")
-        return
-    print("bank_name",bank_name)
-    metadata = [("authorization", jwt_token)]
-    request = payment_gateway_pb2.BalanceRequest(bank_name=bank_name)
-    attempt = 0
-    while attempt < MAX_RETRIES:
-        try:
-            response = stub.CheckBalance(request, metadata=metadata)
-            print(f"💰 Your Balance: {response.balance}")
-            logging.info(f"✅ Balance check successful.")
-            is_online = True  # Mark system as online
-            return
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNAVAILABLE:
-                attempt += 1
-                logging.warning(f"🔄 Retrying balance check... Attempt {attempt}/{MAX_RETRIES}")
-                print(f"🔄 Retrying balance check... Attempt {attempt}/{MAX_RETRIES}")
-                time.sleep(RETRY_DELAY)
-                initialize_stub()
-                is_online = False  # Mark system as offline
-            else:
-                print(f"❌ Balance check failed: {e.code()} - {e.details()}")
-                logging.error(f"❌ Balance check failed: {e.code()} - {e.details()}")
-                return
-
-    logging.error(f"❌ Balance check failed after {MAX_RETRIES} attempts.")
-    print("❌ Balance check failed after multiple attempts. Please try again later.")
-    is_online = False  # Mark system as offline
-
-
-
-
-
-def process_payment(stub, sender_bank_name, receiver_username, receiver_bank_name, amount):
-    """Processes a payment using JWT authentication with automatic offline queuing."""
-    global is_online, offline_queue
-
-    if jwt_token is None:
-        print("❌ Please authenticate first.")
-        return
-
-    # Generate a unique transaction ID for idempotency
-    transaction_id = str(uuid.uuid4())
-    timestamp = datetime.now().isoformat()
-
-    # Create payment data structure for offline queueing
-    payment_data = {
-        "transaction_id": transaction_id,
-        "sender_bank_name": sender_bank_name,
-        "receiver_username": receiver_username,
-        "receiver_bank_name": receiver_bank_name,
-        "amount": amount,
-        "timestamp": timestamp,
-    }
-
-    # If offline, queue the payment automatically
-    if not is_online:
-        with queue_lock:
-            offline_queue.append(payment_data)
-            save_offline_queue()
-        print(f"📝 Payment queued for offline processing (Transaction ID: {transaction_id})")
-        logging.info(f"💳 Payment of ₹{amount} to {receiver_username}@{receiver_bank_name} queued for offline processing.")
-        return
-
-    metadata = [("authorization", jwt_token)]
-    request = payment_gateway_pb2.PaymentRequest(
-        sender_bank_name=sender_bank_name,  # ✅ Only sender_bank_name (no account number)
-        receiver_username=receiver_username,
-        receiver_bank_name=receiver_bank_name,
-        amount=amount,
-        transaction_id=transaction_id
-    )
-
-    attempt = 0
-    while attempt < MAX_RETRIES:
-        try:
-            response = stub.ProcessPayment(request, metadata=metadata)
-            print(f"📌 Payment Status: {response.message}")
-            logging.info(f"✅ Payment of ₹{amount} from {sender_bank_name} to {receiver_username}@{receiver_bank_name} succeeded.")
-            is_online = True  # Mark system as online
-            return
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNAVAILABLE:
-                attempt += 1
-                logging.warning(f"🔄 Retrying payment... Attempt {attempt}/{MAX_RETRIES}")
-                print(f"🔄 Retrying payment... Attempt {attempt}/{MAX_RETRIES}")
-                time.sleep(RETRY_DELAY)
-                initialize_stub()
-                if attempt >= MAX_RETRIES:
-                    with queue_lock:
-                        offline_queue.append(payment_data)
-                        save_offline_queue()
-                    print(f"📝 Payment queued for offline processing after failed retries (Transaction ID: {transaction_id})")
-                    logging.info(f"💳 Payment of ₹{amount} to {receiver_username}@{receiver_bank_name} queued for offline processing after failed retries.")
-                    is_online = False  # Mark system as offline
-                    return
-            elif e.code() == grpc.StatusCode.FAILED_PRECONDITION:
-                print("❌ Transaction failed: Insufficient funds.")
-                logging.warning(f"❌ Payment of ₹{amount} from {sender_bank_name} to {receiver_username}@{receiver_bank_name} failed due to insufficient funds.")
-                return
-            elif e.code() == grpc.StatusCode.ALREADY_EXISTS:
-                print("❌ Transaction with this ID already processed.")
-                logging.warning(f"❌ Payment with ID {transaction_id} already processed.")
-                return
-            else:
-                print(f"❌ Payment failed: {e.code()} - {e.details()}")
-                logging.error(f"❌ Payment failed: {e.code()} - {e.details()}")
-                return
-
-    logging.error(f"❌ Payment permanently failed after {MAX_RETRIES} attempts.")
-    print("❌ Payment failed after multiple attempts. Please try again later.")
-    is_online = False  # Mark system as offline
-
-
-
-
-def logout_client(stub):
-    """Logs out the user by sending a logout request with the current token."""
-    global jwt_token  # Ensure token is globally updated
-
-    if not jwt_token:
-        print("❌ You are not logged in.")
-        return
-
-    metadata = [("authorization", jwt_token)]
-    request = payment_gateway_pb2.LogoutRequest()
-    attempt = 0
-    while attempt < MAX_RETRIES:
-
-        try:
-            response = stub.LogoutClient(request, metadata=metadata)
-            if response.success:
-                jwt_token = None  # Invalidate locally
-                print("✅ Logout successful!")
-                is_online = True  # Mark system as online
-                return
-            else:
-                print(f"❌ Logout failed: {response.message}")
-                is_online = True  # Mark system as online
-                return
-
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNAVAILABLE:
-                attempt += 1
-                logging.warning(f"🔄 Retrying logout... Attempt {attempt}/{MAX_RETRIES}")
-                print(f"🔄 Retrying logout... Attempt {attempt}/{MAX_RETRIES}")
-                time.sleep(RETRY_DELAY)
-                initialize_stub()
-                is_online = False  # Mark system as offline
-            else:    
-                print(f"❌ Logout error: {e.code()} - {e.details()}")
-                return     
-
-
-
-def process_offline_queue():
-    """Process all pending offline payments automatically."""
-    global offline_queue
-    
-    if not offline_queue:
-        # print("✅ No pending offline payments to process.")
-        return
-    
-    if jwt_token is None:
-        print("❌ Please authenticate first before processing offline payments.")
-        return
-    
-    # print(f"🔄 Processing {len(offline_queue)} offline payments...")
-    
-    with queue_lock:
-        current_queue = offline_queue.copy()
-    
-    successful_payments = []
-    
-    for payment in current_queue:
-        # print(f"🔄 Processing offline payment to {payment['to_account']}, amount: ₹{payment['amount']}")
-        
-        metadata = [("authorization", jwt_token)]
-        request = payment_gateway_pb2.PaymentRequest(
-             sender_bank_name=payment["sender_bank_name"],  # ✅ Only sender_bank_name (no account number)
-            receiver_username=payment["receiver_username"],
-            receiver_bank_name=payment["receiver_bank_name"],
-            amount=payment["amount"],
-            transaction_id=payment["transaction_id"]
-            
-        )
-        
-        try:
-            response = stub.ProcessPayment(request, metadata=metadata)
-            print(f"✅ Offline payment processed: {response.message}")
-            logging.info(f"✅ Offline payment (ID: {payment['transaction_id']}) of ₹{payment['amount']} to {payment['to_account']} processed successfully.")
-            successful_payments.append(payment)
-            
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.ALREADY_EXISTS:
-                # print(f"✅ Payment already processed (Transaction ID: {payment['transaction_id']})")
-                logging.info(f"Payment already processed (Transaction ID: {payment['transaction_id']})")
-                successful_payments.append(payment)
-            elif e.code() == grpc.StatusCode.FAILED_PRECONDITION:
-                print(f"❌ Offline payment failed: Insufficient funds (Transaction ID: {payment['transaction_id']})")
-                logging.warning(f"❌ Offline payment failed: Insufficient funds (Transaction ID: {payment['transaction_id']})")
-                successful_payments.append(payment)
-            elif e.code() == grpc.StatusCode.INVALID_ARGUMENT:  
-                print("Cannot transfer money to your own account within the same bank.")
-                logging.error("Cannot transfer money to your own account within the same bank.")  
-            else:
-                print(f"❌ Failed to process offline payment: {e.code()} - {e.details()}")
-                logging.error(f"❌ Failed to process offline payment (ID: {payment['transaction_id']}): {e.code()} - {e.details()}")
-        except Exception as ex:
-            print(f"❌ Unexpected error processing offline payment: {str(ex)}")
-            logging.error(f"❌ Unexpected error processing offline payment (ID: {payment['transaction_id']}): {str(ex)}")
-    
-    with queue_lock:
-        offline_queue = [p for p in offline_queue if p not in successful_payments]
-        save_offline_queue()
-    logging.info(f"Processed {len(successful_payments)} offline payments. {len(offline_queue)} remaining.")
-    print(f"✅ Processed {len(successful_payments)} offline payments. {len(offline_queue)} remaining.")
-
-def check_connection():
-    """Check if the payment gateway is reachable."""
-    global is_online
-    
-    try:
-        if stub is None:
-            initialize_stub()
-        # logging.info("🔄 Checking connection...")
-        dummy_request = payment_gateway_pb2.AuthRequest(username="ping", password="ping")
-        stub.AuthenticateClient(dummy_request, timeout=2)
-        
-        is_online = True
-        return True
-    except Exception:
-        is_online = False
-        return False
-
-def connection_monitor():
-    """Background thread to monitor connection and automatically process offline payments when online."""
-    # global is_online
-    
-    logging.info("Connection monitor started")
-    
-    while True:
-        try:
-            current_status = is_online
-            new_status = check_connection()
-            
-            # If connection was restored and we have authentication
-            if new_status and jwt_token is not None and offline_queue:
-                print(f"DEBUG: offline_queue contents: {offline_queue} (length: {len(offline_queue)})")
-
-                # Only log if status changed or we have payments to process
-                if not current_status:
-                    logging.info("🌐 Connection restored, processing offline queue...")
-                    print("🌐 Connection restored, processing offline queue...")
-                
-                # Process the offline queue automatically
-                process_offline_queue()
-            
-            # Sleep for a bit before checking again
-            time.sleep(RECONNECT_INTERVAL)
-        except Exception as e:
-            logging.error(f"Error in connection monitor: {str(e)}")
-            time.sleep(RECONNECT_INTERVAL)
-
-
-def initialize_stub():
-    """Creates a secure gRPC connection with TLS."""
-    global stub
-
-    try:
-        with open("../certs/client/client.key", "rb") as f:
-            private_key = f.read()
-        with open("../certs/client/client.crt", "rb") as f:
-            certificate_chain = f.read()
-        with open("../certs/ca/ca.crt", "rb") as f:
-            root_certificates = f.read()
-        
-        credentials = grpc.ssl_channel_credentials(
-            root_certificates=root_certificates,
-            private_key=private_key,
-            certificate_chain=certificate_chain
-        )
-        
-        options = [
-            ('grpc.max_receive_message_length', 10 * 1024 * 1024),
-            ('grpc.max_send_message_length', 10 * 1024 * 1024),
-            ('grpc.keepalive_time_ms', 30000),
-            ('grpc.keepalive_timeout_ms', 10000)
-        ]
-        
-        channel = grpc.secure_channel("localhost:50052", credentials, options=options)
-        stub = payment_gateway_pb2_grpc.PaymentGatewayStub(channel)
-          # ✅ Verify the connection by making a lightweight test call
-        try:
-            grpc.channel_ready_future(channel).result(timeout=3)  # Wait for connection
-            print("🔄 Secure gRPC connection established.")
-            logging.info("Secure gRPC connection established.")
+            grpc.channel_ready_future(self.channel).result(timeout=2)
+            return True
         except grpc.FutureTimeoutError:
-            print("❌ Failed to connect: Payment Gateway is down.")
-            logging.error("Failed to connect: Payment Gateway is down.")
-    except Exception as e:
-        print(f"❌ Failed to initialize connection: {str(e)}")
-        logging.error(f"Failed to initialize connection: {str(e)}")
+            return False
 
-
-def view_transaction_history(stub):
-    """Request and display the user's transaction history with updated fields."""
-    if jwt_token is None:
-        print("❌ Please authenticate first.")
-        return
-
-    metadata = [("authorization", jwt_token)]
-    request = payment_gateway_pb2.TransactionHistoryRequest()
-    print("🔄 Request sent")
-
-    attempt = 0
-    while attempt < MAX_RETRIES:
+    def _load_queue(self):
         try:
-            response = stub.ViewTransactionHistory(request, metadata=metadata)
-            print("✅ Response received")
-            transactions = response.transactions  # ✅ Fetch transactions from gRPC response
-            
-            if not transactions:
-                print("📜 No transaction history available.")
-                is_online = True  # Mark system as online
-                return
+            return json.loads(OFFLINE_QUEUE_FILE.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
 
-            print("\n📜 Transaction History:")
-            print("🆔 Transaction ID | 🏦 From Bank | 🏦 To Bank | 💰 Amount | 📌 Status | 📅 Timestamp")
-            print("-" * 120)
-            
-            for txn in transactions:
-                from_account_display = txn.from_account_no if txn.from_account_no else "N/A"
-                to_user_display = txn.to_user_id if txn.to_user_id else "N/A"
-                from_user_display = txn.from_user_id if txn.from_user_id else "N/A"
-                
-                print(f"🆔 {txn.transaction_id} | 🏦 {txn.from_bank} | 🏦 {txn.to_bank} | ₹{txn.amount} | {txn.status} | 📅 {txn.timestamp}")
+    def _save_queue(self):
+        OFFLINE_QUEUE_FILE.write_text(json.dumps(self.offline_queue, indent=2), encoding="utf-8")
 
-                if from_account_display != "N/A":
-                    print(f"   🔹 From Account No: {from_account_display}")
-                if to_user_display != "N/A":
-                    print(f"   🔹 To User ID: {to_user_display}")
-                if from_user_display != "N/A":
-                    print(f"   🔹 From User ID: {from_user_display}")
-                
-                print("-" * 120)
+    # -- operations --------------------------------------------------------
+    def login(self, username, password):
+        response = self._call(self.stub.AuthenticateClient,
+                              payment_gateway_pb2.AuthRequest(username=username, password=password))
+        if response.authenticated:
+            self.token = response.token
+            log.info("Logged in as %s", username)
+        return response.authenticated, response.message
 
-            return     
+    def logout(self):
+        response = self._call(self.stub.LogoutClient, payment_gateway_pb2.LogoutRequest())
+        self.token = None
+        return response.message
+
+    def balance(self, bank_name):
+        return self._call(self.stub.CheckBalance, payment_gateway_pb2.BalanceRequest(bank_name=bank_name))
+
+    def history(self):
+        return self._call(self.stub.ViewTransactionHistory, payment_gateway_pb2.TransactionHistoryRequest()).transactions
+
+    def pay(self, payment):
+        request = payment_gateway_pb2.PaymentRequest(**payment)
+        return self._call(self.stub.ProcessPayment, request)
+
+    def pay_or_queue(self, sender_bank, receiver, receiver_bank, amount_paise):
+        payment = {
+            "transaction_id": uuid.uuid4().hex,
+            "sender_bank_name": sender_bank,
+            "receiver_username": receiver,
+            "receiver_bank_name": receiver_bank,
+            "amount_paise": amount_paise,
+        }
+        try:
+            return self.pay(payment)
         except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNAVAILABLE:
-                attempt += 1
-                logging.warning(f"🔄 Retrying Transaction History... Attempt {attempt}/{MAX_RETRIES}")
-                print(f"🔄 Retrying Transaction History... Attempt {attempt}/{MAX_RETRIES}")
-                time.sleep(RETRY_DELAY)
-                initialize_stub()
-                is_online = False  # Mark system as offline
-            else:       
-                print(f"❌ Error fetching transaction history: {e.code()} - {e.details()}")
-                logging.error(f"❌ Error fetching transaction history: {e.code()} - {e.details()}")
-                return
+            if e.code() not in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
+                raise
+        with self.queue_lock:
+            self.offline_queue.append(payment)
+            self._save_queue()
+        log.info("Queued payment %s while offline", payment["transaction_id"])
+        return None
+
+    def flush_offline_queue(self):
+        """Send queued payments. Retrying with the same id is safe."""
+        if not self.token:
+            return
+        with self.queue_lock:
+            pending = list(self.offline_queue)
+        done = []
+        for payment in pending:
+            try:
+                response = self.pay(payment)
+                print(f"\n[offline queue] {payment['transaction_id']}: {response.status} - {response.message}")
+                done.append(payment["transaction_id"])
+            except grpc.RpcError as e:
+                if e.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED,
+                                grpc.StatusCode.UNAUTHENTICATED):
+                    break  # try again later
+                print(f"\n[offline queue] {payment['transaction_id']} rejected: {e.details()}")
+                done.append(payment["transaction_id"])
+        if done:
+            with self.queue_lock:
+                self.offline_queue = [p for p in self.offline_queue if p["transaction_id"] not in done]
+                self._save_queue()
+
+    def monitor(self, stop):
+        """Background loop that flushes the offline queue when the gateway is reachable."""
+        while not stop.wait(RECONNECT_INTERVAL):
+            if self.offline_queue and self.is_online():
+                try:
+                    self.flush_offline_queue()
+                except Exception:
+                    log.exception("Flushing offline queue failed")
+
+
+def print_history(transactions):
+    if not transactions:
+        print("No transactions yet.")
+        return
+    for txn in transactions:
+        direction = f"to {txn.to_user_id}" if txn.to_user_id else f"from {txn.from_user_id}"
+        print(f"{txn.timestamp}  {txn.transaction_id}  {rupees(txn.amount_paise)} {direction} "
+              f"({txn.from_bank} -> {txn.to_bank})  {txn.status}"
+              + (f"  [{txn.message}]" if txn.status.startswith("ABORT") and txn.message else ""))
+
+
+MENU = """
+1. Log in
+2. Make a payment
+3. Check balance
+4. Transaction history
+5. Log out
+6. Exit"""
+
 
 def main():
-    initialize_stub()  # ✅ Initialize stub at startup# Load any pending offline payments
-    load_offline_queue() # Load any pending offline payments
-    
-    # Start the background connection monitor thread
-    monitor_thread = Thread(target=connection_monitor, daemon=True)
-    monitor_thread.start()
-    logging.info("Started background connection monitor")
-    print("🔄 Started background connection monitor")
+    client = GatewayClient()
+    stop = threading.Event()
+    threading.Thread(target=client.monitor, args=(stop,), daemon=True).start()
+    if client.offline_queue:
+        print(f"{len(client.offline_queue)} queued payment(s) will be sent after you log in.")
 
     while True:
-        print("\nOptions:")
-        # print("1. Register Client")
-        print("1. Authenticate")
-        print("2. Process Payment")
-        print("3. Check Balance")
-        print("4. View Transaction History")
-        print("5. Logout")
-        print("6. Exit")
-        option = input("Select an option: ")
-
-        if option == "1":
-            username = input("Enter username: ")
-            password = input("Enter password: ")
-            authenticate_client( stub , username, password)
-
-        elif option == "2":
-            sender_bank_name= input("Enter sender bank name: ")
-            receiver_username = input("Enter recipient username: ")
-            receiver_bank_name = input("Enter recipient bank name: ")
-             # ✅ Validate amount input
-
-            try:
-                amount = float(input("Enter amount: "))
-                if amount <= 0:
-                    print("❌ Amount must be greater than zero. Please enter a valid amount.")
-                    continue  # Go back to the menu without calling process_payment
-            except ValueError:
-                print("❌ Invalid amount! Please enter a numeric value.")
-                continue  # Go back to the menu without calling process_payment
-            process_payment(stub, sender_bank_name,receiver_username, receiver_bank_name, amount)
-
-        elif option == "3":
-            bank_name = input("Enter your bank name: ") 
-            check_balance(stub,bank_name)
-
-        elif option == "4":
-            view_transaction_history(stub) 
-
-        elif option == "5":
-            logout_client(stub)   
-
-        elif option == "6":
-            print("🚀 Exiting...")
+        print(MENU)
+        try:
+            option = input("Select an option: ").strip()
+            if option == "1":
+                ok, message = client.login(input("Username: ").strip(), input("Password: "))
+                print(message)
+                if ok:
+                    client.flush_offline_queue()
+            elif option == "6":
+                break
+            elif client.token is None and option in {"2", "3", "4", "5"}:
+                print("Please log in first.")
+            elif option == "2":
+                sender_bank = input("Your bank: ").strip().upper()
+                receiver = input("Recipient username: ").strip()
+                receiver_bank = input("Recipient bank: ").strip().upper()
+                amount = parse_amount(input("Amount (Rs): "))
+                if amount is None:
+                    print("Enter a positive amount with at most two decimal places.")
+                    continue
+                response = client.pay_or_queue(sender_bank, receiver, receiver_bank, amount)
+                if response is None:
+                    print("Gateway unreachable: payment queued and will be sent automatically.")
+                else:
+                    print(f"{response.status}: {response.message} (id {response.transaction_id})")
+            elif option == "3":
+                response = client.balance(input("Bank: ").strip().upper())
+                print(f"Balance {rupees(response.balance_paise)}, available {rupees(response.available_paise)}")
+            elif option == "4":
+                print_history(client.history())
+            elif option == "5":
+                print(client.logout())
+            else:
+                print("Invalid option.")
+        except EOFError:
             break
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                client.token = None
+                print(f"Session ended ({e.details()}). Please log in again.")
+            else:
+                print(f"Error: {e.details()} [{e.code().name}]")
+    stop.set()
 
-        else:
-            print("❌ Invalid option. Please try again.")
 
 if __name__ == "__main__":
-    main()  # ✅ Now only one function handles everything
-
-
-
-
-
-
-
-
-
-
-
-
+    main()
