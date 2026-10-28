@@ -53,7 +53,7 @@ PREPARING --both banks vote yes--> COMMITTING --both acknowledge--> COMMITTED
 5. **Phase 2.** Commit and abort are idempotent at the banks, so the gateway can retry them safely. An abort for a transaction a bank never saw leaves a tombstone, so a delayed prepare arriving later is refused.
 6. **Recovery.** A background worker, which also runs right after a restart, retries phase 2 for every `COMMITTING`/`ABORTING` payment until both banks acknowledge. A payment stuck in `PREPARING` past a timeout is aborted (*presumed abort*), because no commit decision was ever logged.
 
-**Why double spending is impossible.** A bank's funds check and its reservation run in one serialised SQLite transaction (`BEGIN IMMEDIATE`). Two concurrent payments therefore cannot both pass the check. The test suite fires 40 concurrent ₹100 payments at a ₹1,500 balance and asserts exactly 15 succeed.
+**Why double spending is impossible.** A bank's funds check and its reservation run as one step on the bank's single database writer, in their own savepoint. Two concurrent payments therefore cannot both pass the check. The test suite fires 40 concurrent ₹100 payments at a ₹1,500 balance and asserts exactly 15 succeed.
 
 ## Security model
 
@@ -129,12 +129,13 @@ Opening balances come from [server/bank_data.json](server/bank_data.json) the fi
 | `PG_PREPARE_TIMEOUT` | `30` | Seconds before an undecided payment is presumed aborted |
 | `PG_BANK_RPC_TIMEOUT` | `3` | Deadline for each gateway → bank call |
 | `PG_SQLITE_SYNC` | `FULL` | `FULL` fsyncs every commit; `NORMAL` survives process crashes but not OS crashes |
+| `PG_GROUP_COMMIT` | `1` | `0` commits each write on its own (for A/B comparisons) |
 </details>
 
 ## Testing
 
 ```sh
-pytest -q                                   # 39 tests, ~25 s
+pytest -q                                   # 49 tests, ~20 s
 python scripts/chaos_demo.py --seconds 60   # kill processes mid-payment, then audit
 python scripts/benchmark.py                 # throughput and latency
 ```
@@ -142,7 +143,7 @@ python scripts/benchmark.py                 # throughput and latency
 The [tests](tests/) start a gateway and three banks in-process on free ports and cover:
 
 - **Payments.** Cross-bank transfers, insufficient funds, server-side amount validation, a specific status code for each error, idempotent retries, a concurrent double-spend attempt, and 120 random concurrent transfers that must conserve money.
-- **Security.** Missing, forged, expired and revoked tokens; revocation surviving a restart; login lockout scoped to the client address and surviving a restart; password spraying across usernames; reading another user's account; bank impersonation; non-client certificates calling user RPCs; non-gateway callers hitting a bank; the per-component key layout.
+- **Security.** Missing, forged (right key id, wrong key), expired and revoked tokens; revocation surviving a restart; login lockout scoped to the client address and surviving a restart; password spraying across usernames; reading another user's account; bank impersonation; non-client certificates calling user RPCs; non-gateway callers hitting a bank; the per-component key layout.
 - **Recovery (fault injection).**
   - A receiver bank's commit fails, then the retry succeeds.
   - A bank is down during prepare.
@@ -151,6 +152,8 @@ The [tests](tests/) start a gateway and three banks in-process on free ports and
   - A bank crashes after voting yes.
   - A late prepare arrives after the abort.
 - **Client.** Rupee parsing; an offline payment queued to disk and sent exactly once after the gateway returns.
+- **Tokens.** EdDSA tokens naming their key; algorithm-confusion (HS256 with the public key), `alg: none` and wrong-issuer tokens refused; a rotation that keeps old sessions valid, then retiring and removing the old key.
+- **Storage.** Concurrent writes share commits; a failing write in a batch rolls back only itself; data is on disk when `write()` returns.
 
 CI runs the suite, the chaos demo, a check that the generated protobuf code is up to date, and a Docker Compose smoke test that also checks each container holds only its own key.
 
@@ -170,23 +173,32 @@ The recovery worker settled 158 payments that were in doubt when a process died:
 
 ### Benchmark
 
-End-to-end payments (gateway and three banks as separate processes, mTLS on every hop, Windows laptop, 8 s per level):
+End-to-end payments (gateway and three banks as separate processes, mTLS on every hop, Windows laptop, 8 s per level). With group commit:
 
 | Concurrent clients | TPS (`FULL` fsync) | p50 / p99 ms | TPS (`NORMAL`) | p50 / p99 ms |
 |---:|---:|---:|---:|---:|
-| 1 | 63 | 15 / 28 | 121 | 8 / 15 |
-| 4 | 118 | 33 / 48 | 203 | 18 / 44 |
-| 16 | 124 | 128 / 172 | 223 | 66 / 126 |
-| 32 | 119 | 247 / 636 | 241 | 129 / 206 |
+| 1 | 64 | 14 / 25 | 123 | 8 / 16 |
+| 4 | 165 | 24 / 37 | 325 | 12 / 23 |
+| 16 | 282 | 52 / 105 | 313 | 48 / 100 |
+| 32 | 311 | 98 / 350 | 364 | 87 / 134 |
 
-Each payment makes three durable writes at the gateway and two at each bank. With `FULL` durability, fsync is the bottleneck: relaxing it to `NORMAL` roughly doubles throughput. `FULL` results also vary up to 2–3× between runs on this laptop because flush latency is noisy. The next step would be group commit: one fsync shared by the log writes of many concurrent payments.
+`FULL` figures are medians of three rounds (`python scripts/benchmark.py --ab PG_GROUP_COMMIT 0 1`).
+
+**Group commit.** Each payment makes three durable writes at the gateway and two at each bank. Previously every write waited for its own fsync, so under `FULL` throughput levelled off at about 120–140 payments/s whatever the client count. Now each process has one writer thread. It takes every write that is waiting, runs each in its own savepoint, and commits the whole batch with a single fsync, and no caller gets a reply before that commit. Interleaved runs against the previous code:
+
+| `FULL`, clients | Before (TPS) | Group commit (TPS) |
+|---:|---:|---:|
+| 16 | 63–128 | 282–297 |
+| 32 | 133–148 | 311–352 |
+
+Throughput under full durability is now 2–2.5× higher at 16–32 clients and close to the `NORMAL` figures, so the durability setting has stopped being the bottleneck. A single client gains nothing, because there is nothing to batch. Below about four clients, results vary up to 2–3× between runs on this laptop because flush latency is noisy.
 
 **Parallel prepare (A/B).** Three runs each of sequential and parallel prepare were alternated under `NORMAL`. Parallel prepare cut single-client median latency from 10.2 ms to 8.1 ms and raised single-client throughput from 92 to 110 payments/s. At 4–16 clients the two were within run-to-run noise, because throughput there is limited by serialised database writes, not by the round trip. Under `FULL` the fsync noise was larger than the difference.
 
 ## Limitations and next steps
 
 - **The coordinator is a single point of failure.** 2PC is a blocking protocol: while the gateway is down, prepared reservations stay held until it recovers, which is safe but not available. Running the coordinator log on a replicated store (Raft or Paxos) would remove this; it is what systems like Spanner do.
-- **One SQLite connection per process** serialises writes. A production system would use PostgreSQL and group commit.
+- **One writer per process.** Group commit batches the fsyncs, but each process still applies its writes one at a time on a single SQLite connection. A production system would use PostgreSQL with row-level locking.
 - **Users live in a JSON file.** A real deployment would use a user database, and keep token signing keys in a KMS or HSM rather than on disk.
 
 ## Repository layout

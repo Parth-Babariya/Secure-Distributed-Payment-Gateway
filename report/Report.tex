@@ -40,7 +40,7 @@ revocable JWT sessions, and every 2PC vote and decision is written to a SQLite
 log before it is acted on, so the system recovers from a crash of the gateway
 or of any bank at any point. A chaos experiment that hard-killed components 15
 times during 2,747 payments ended with every payment atomic and the total money
-unchanged; 39 automated tests cover payments, security and recovery. This
+unchanged; 49 automated tests cover payments, security, recovery and storage. This
 report describes the design, argues its correctness, and presents the
 measurements.
 \end{abstract}
@@ -101,7 +101,8 @@ requirements:
 \begin{itemize}
   \item Central coordinator: validates requests, runs 2PC and answers queries.
   \item Persists payments, the bank directory and revoked tokens in
-        \code{gateway.db} (SQLite, WAL mode, \code{fsync} on every commit).
+        \code{gateway.db} (SQLite, WAL mode, \code{fsync} on every commit, shared through group
+        commit).
   \item Runs a \emph{recovery worker} that drives in-doubt payments to a final
         state (Section~\ref{sec:recovery}).
   \item gRPC methods: \code{AuthenticateClient}, \code{LogoutClient},
@@ -191,9 +192,19 @@ this layout.
         address, an attacker cannot lock the real user out from elsewhere, and
         the address-wide counter stops password spraying. A restart does not
         reset the counters.
-  \item A successful login returns an HS256 JWT with subject, issue time,
-        15-minute expiry and a unique id (\code{jti}). The signing key comes
-        from \code{PG_JWT_SECRET} and must be at least 32 characters.
+  \item A successful login returns a JWT with issuer, subject, issue time,
+        15-minute expiry and a unique id (\code{jti}), signed with Ed25519
+        (\code{EdDSA}). Only the gateway holds the private key; a service that
+        merely checks tokens needs only the public key and cannot mint one.
+        Verification accepts \code{EdDSA} alone, so \code{alg: none} tokens and
+        HS256 tokens ``signed'' with the public key are refused.
+  \item Keys rotate without logging anyone out. Each token names its key in
+        the \code{kid} header; the key directory holds \code{<kid>.key}
+        (signs) and \code{<kid>.pub} (verifies only) files, the newest private
+        key signs, and the gateway re-reads the directory when it changes. A
+        rotation adds a key, waits one token lifetime, then retires the old
+        key to its public half (\code{scripts/rotate_jwt_key.py}). In Docker
+        the keys live in a volume that only the gateway mounts.
   \item Logout revokes the token's \code{jti}. The revocation list is stored in
         \code{gateway.db}, so a revoked token stays invalid across restarts.
 \end{itemize}
@@ -248,8 +259,9 @@ status \st{Preparing}. The client-generated transaction id is the primary key.
 
 \subsection{Phase 1: prepare}
 The gateway asks, in parallel, the sender's bank to prepare a \st{Debit} and
-the receiver's bank to prepare a \st{Credit}. Each bank votes inside one serialised SQLite
-transaction (\code{BEGIN IMMEDIATE}):
+the receiver's bank to prepare a \st{Credit}. Each bank votes in one step on
+its single database writer, so the check and the reservation are serialised
+against every other write:
 \begin{itemize}
   \item \textbf{Debit:} vote yes only if
         $\text{balance} - \text{reserved} \ge \text{amount}$, where
@@ -408,7 +420,7 @@ Delayed prepare after an abort & Refused because of the abort tombstone. \\
 \section{Evaluation}
 
 \subsection{Automated tests}
-39 pytest tests start a gateway and three banks in-process on free ports:
+49 pytest tests, most of which start a gateway and three banks in-process on free ports:
 \begin{itemize}
   \item \textbf{Payments (7):} cross-bank transfer; insufficient funds;
         server-side rejection of zero, negative and oversized amounts; specific
@@ -426,6 +438,11 @@ Delayed prepare after an abort & Refused because of the abort tombstone. \\
         malformed operation.
   \item \textbf{Client (12):} exact rupee parsing, and an offline payment sent
         exactly once after the gateway returns.
+  \item \textbf{Tokens (5):} EdDSA tokens naming their key; algorithm
+        confusion, \code{alg: none} and wrong-issuer tokens refused; a key
+        rotation that keeps existing sessions valid.
+  \item \textbf{Storage (5):} concurrent writes share commits; a failing write
+        rolls back only itself; data is on disk when \code{write()} returns.
 \end{itemize}
 
 \subsection{Chaos experiment}
@@ -466,23 +483,33 @@ concurrencies (8 seconds per level, Windows laptop). Each payment performs four
 gateway-to-bank calls and seven durable writes: three at the gateway and two at
 each bank.
 
+Each process commits its writes through a single writer thread with
+\emph{group commit}: the writer takes every write that is waiting, runs each in
+its own savepoint, and commits the batch with one fsync. No caller is answered
+before that commit, so durability is unchanged, but concurrent payments share
+flushes.
+
 \begin{figure}[H]
 \centering
-\begin{tikzpicture}[x=1.0cm,y=0.022cm]
+\begin{tikzpicture}[x=1.0cm,y=0.0135cm]
   \draw[->] (0,0) -- (7.0,0) node[right,font=\small] {clients};
-  \draw[->] (0,0) -- (0,250) node[above,font=\small] {payments/s};
-  \foreach \y in {50,100,150,200} {\draw (0.08,\y) -- (-0.08,\y) node[left,font=\scriptsize] {\y};
+  \draw[->] (0,0) -- (0,400) node[above,font=\small] {payments/s};
+  \foreach \y in {100,200,300} {\draw (0.08,\y) -- (-0.08,\y) node[left,font=\scriptsize] {\y};
     \draw[black!10] (0.1,\y) -- (6.8,\y);}
-  \foreach \x/\l in {0.8/1,2.4/4,4.0/16,5.6/32} {\draw (\x,3) -- (\x,-3) node[below,font=\scriptsize] {\l};}
-  \draw[very thick,blue!70!black] (0.8,63) -- (2.4,118) -- (4.0,124) -- (5.6,119);
-  \foreach \x/\y in {0.8/63,2.4/118,4.0/124,5.6/119} {\fill[blue!70!black] (\x,\y) circle (2pt);}
-  \draw[very thick,orange!85!black,dashed] (0.8,121) -- (2.4,203) -- (4.0,223) -- (5.6,241);
-  \foreach \x/\y in {0.8/121,2.4/203,4.0/223,5.6/241} {\fill[orange!85!black] (\x,\y) circle (2pt);}
-  \node[font=\scriptsize,blue!70!black,anchor=west] at (5.75,119) {FULL};
-  \node[font=\scriptsize,orange!85!black,anchor=west] at (5.75,241) {NORMAL};
+  \foreach \x/\l in {0.8/1,2.4/4,4.0/16,5.6/32} {\draw (\x,4) -- (\x,-4) node[below,font=\scriptsize] {\l};}
+  \draw[thick,black!45,dotted] (0.8,63) -- (2.4,118) -- (4.0,124) -- (5.6,119);
+  \foreach \x/\y in {0.8/63,2.4/118,4.0/124,5.6/119} {\fill[black!45] (\x,\y) circle (1.6pt);}
+  \draw[very thick,blue!70!black] (0.8,64) -- (2.4,165) -- (4.0,282) -- (5.6,311);
+  \foreach \x/\y in {0.8/64,2.4/165,4.0/282,5.6/311} {\fill[blue!70!black] (\x,\y) circle (2pt);}
+  \draw[very thick,orange!85!black,dashed] (0.8,123) -- (2.4,325) -- (4.0,313) -- (5.6,364);
+  \foreach \x/\y in {0.8/123,2.4/325,4.0/313,5.6/364} {\fill[orange!85!black] (\x,\y) circle (2pt);}
+  \node[font=\scriptsize,black!55,anchor=west] at (5.75,119) {FULL, no batching};
+  \node[font=\scriptsize,blue!70!black,anchor=west] at (5.75,305) {FULL};
+  \node[font=\scriptsize,orange!85!black,anchor=west] at (5.75,372) {NORMAL};
 \end{tikzpicture}
-\caption{Throughput with SQLite \code{synchronous=FULL} (fsync on every commit,
-the default) and \code{NORMAL}.}
+\caption{Throughput with group commit under SQLite \code{synchronous=FULL}
+(fsync on every commit, the default) and \code{NORMAL}, against the previous
+one-fsync-per-write design under \code{FULL}.}
 \end{figure}
 
 \begin{center}
@@ -492,24 +519,27 @@ the default) and \code{NORMAL}.}
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
 Clients & TPS & p50 / p99 (ms) & TPS & p50 / p99 (ms) \\
 \midrule
-1  & 63  & 15 / 28   & 121 & 8 / 15 \\
-4  & 118 & 33 / 48   & 203 & 18 / 44 \\
-16 & 124 & 128 / 172 & 223 & 66 / 126 \\
-32 & 119 & 247 / 636 & 241 & 129 / 206 \\
+1  & 64  & 14 / 25  & 123 & 8 / 16 \\
+4  & 165 & 24 / 37  & 325 & 12 / 23 \\
+16 & 282 & 52 / 105 & 313 & 48 / 100 \\
+32 & 311 & 98 / 350 & 364 & 87 / 134 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \paragraph{Discussion.}
-With full durability, throughput is limited by disk flushes, not by gRPC or
-TLS. Every commit waits for an fsync, and each process issues its writes one at
-a time, so beyond about four clients extra clients mostly add queueing delay.
-Relaxing to \code{NORMAL} roughly doubles throughput. In WAL mode that setting
-still survives process crashes, but it may lose the last commits on an
-operating-system crash or power loss. \code{FULL} results also vary by up to
-2--3$\times$ between runs on this laptop, because flush latency is noisy. The
-usual way to keep full durability at higher throughput is \emph{group commit}:
-one fsync shared by the writes of many concurrent payments.
+With one fsync per write, throughput under full durability levelled off at
+about 120--140 payments/s regardless of the number of clients: each process
+flushed its writes one at a time, so extra clients only queued. Group commit
+removes that ceiling. In interleaved runs against the previous code,
+throughput at 16 clients rose from 63--128 to 282--297 payments/s, and at 32
+clients from 133--148 to 311--352. It is now close to the \code{NORMAL} figures,
+which trade the last commits on an operating-system crash for speed, so that
+trade-off is no longer needed for throughput. A single client gains nothing,
+since there is nothing to batch. Below about four clients the results vary by up
+to 2--3$\times$ between runs on this laptop because flush latency is noisy, so
+comparisons use interleaved A/B rounds
+(\code{benchmark.py --ab PG_GROUP_COMMIT 0 1}).
 
 \paragraph{Parallel prepare.}
 The gateway asks both banks to prepare at the same time. An A/B comparison
@@ -550,12 +580,13 @@ its own key.
         and 2PC blocks while it is down. Replicating the coordinator log with a
         consensus protocol (Raft or Paxos), as Spanner does, would let another
         replica finish in-doubt payments.
-  \item \textbf{Storage.} SQLite with one connection per process serialises
-        writes. PostgreSQL with group commit would raise throughput while
-        keeping full durability.
-  \item \textbf{Identity.} Users come from a JSON file, and tokens are signed
-        with one shared HS256 key. A production system would use a user
-        database and asymmetric signing keys (RS256 or EdDSA) with rotation.
+  \item \textbf{Storage.} Group commit shares fsyncs, but each process still
+        applies its writes one at a time on one SQLite connection. PostgreSQL
+        with row-level locking would let independent accounts proceed in
+        parallel.
+  \item \textbf{Identity.} Users come from a JSON file, and token signing
+        keys are files on disk. A production system would use a user database
+        and keep signing keys in a KMS or HSM.
   \item \textbf{Operations.} Metrics such as Prometheus counters for payment
         outcomes and recovery backlog, and an admin view of in-doubt payments.
 \end{itemize}
