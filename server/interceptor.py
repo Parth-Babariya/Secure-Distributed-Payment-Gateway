@@ -1,215 +1,92 @@
+"""gRPC server interceptors: authentication, peer identity and access logging."""
 import logging
+import time
+
 import grpc
-import jwt
-from grpc import StatusCode
 
-# Configure logging
-logging.basicConfig(filename="interceptortransactions.log", level=logging.INFO, format="%(asctime)s - %(message)s")
+from auth import TokenError
+from tls import peer_common_name
 
-# Secret key for JWT verification (must match the one used in `payment_gateway.py`)
-JWT_SECRET = "supersecretkey"
+log = logging.getLogger("access")
 
 
-class RegisterBankInterceptor(grpc.ServerInterceptor):
-    def intercept_service(self, continuation, handler_call_details):
-        """Interceptor specifically for bank registration requests."""
-        method = handler_call_details.method
-        
-        # Only apply logic to RegisterBank method
-        if "/PaymentGateway/RegisterBank" in method:
-            print(f"Processing bank registration request for method: {method}")
-            
-            # Extract metadata
-            metadata = dict(handler_call_details.invocation_metadata)
-            bank_name = metadata.get("bank_name", "Unknown Bank")
-            
-            # Log the bank registration attempt
-            logging.info(f"🏦 Bank registration attempt: {bank_name}")
-            
-            try:
-                # Execute the original method
-                response = continuation(handler_call_details)
-                
-                # Log successful registration
-                logging.info(f"✅ Successfully registered bank: {bank_name}")
-                return response
-            except grpc.RpcError as e:
-                # Log registration failure
-                logging.error(f"❌ Bank registration failed for {bank_name}: {e.code()} - {e.details()}")
-                raise e
-        else:
-            # For non-bank registration methods, just pass through
-            return continuation(handler_call_details)
+def _abort_handler(code, details):
+    """A handler that rejects the call with the given status."""
+    def reject(request, context):
+        context.abort(code, details)
+    return grpc.unary_unary_rpc_method_handler(reject)
+
+
+def _wrap_unary(handler, wrapper_factory):
+    """Return a copy of a unary-unary handler whose behaviour is wrapped."""
+    if handler is None or handler.unary_unary is None:
+        return handler
+    return grpc.unary_unary_rpc_method_handler(
+        wrapper_factory(handler.unary_unary),
+        request_deserializer=handler.request_deserializer,
+        response_serializer=handler.response_serializer,
+    )
+
+
+def _method_name(full_method):
+    return full_method.rsplit("/", 1)[-1]
+
 
 class AuthorizationInterceptor(grpc.ServerInterceptor):
+    """Requires a valid, unrevoked JWT on every method except the exempt ones."""
+
+    def __init__(self, tokens, exempt_methods):
+        self.tokens = tokens
+        self.exempt_methods = set(exempt_methods)
+
     def intercept_service(self, continuation, handler_call_details):
-        """Intercepts gRPC requests to enforce authorization checks."""
-        method = handler_call_details.method
-
-        # Skip auth check for the exempt methods
-        exempt_methods = ["/PaymentGateway/AuthenticateClient", "/PaymentGateway/RegisterBank"]
-        if any(exempt_method in method for exempt_method in exempt_methods):
+        if _method_name(handler_call_details.method) in self.exempt_methods:
             return continuation(handler_call_details)
-
-        # method = handler_call_details.method
-
-        # Extract JWT from metadata
-        metadata = dict(handler_call_details.invocation_metadata)
-        token = metadata.get("authorization")
-        print(f"Token: {token}")
-        # Skip auth check for the authentication method itself
-        if "/PaymentGateway/AuthenticateClient" in method:
-            return continuation(handler_call_details)
-
-        if not token:
-            logging.warning(f"❌ Unauthorized request to {method} - No token provided.")
-            context = self._create_abortion_context(StatusCode.UNAUTHENTICATED, "Missing authentication token.")
-            return context
-
-        # Decode JWT Token
+        metadata = dict(handler_call_details.invocation_metadata or ())
         try:
-            decoded_token = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-            username = decoded_token.get("username")
-        except jwt.ExpiredSignatureError:
-            logging.warning(f"❌ Unauthorized request to {method} - Token expired.")
-            context = self._create_abortion_context(StatusCode.UNAUTHENTICATED, "Token expired.")
-            return context
-        except jwt.InvalidTokenError:
-            logging.warning(f"❌ Unauthorized request to {method} - Invalid token.")
-            context = self._create_abortion_context(StatusCode.UNAUTHENTICATED, "Invalid token.")
-            return context
-
-        logging.info(f"✅ Authorized request from {username} - Method: {method}")
-
-        # Additional Authorization: Restrict Access Based on Method
-        if "/PaymentGateway/CheckBalance" in method:
-            requested_user = metadata.get("username")
-            if requested_user and requested_user != username:
-                logging.warning(f"❌ Unauthorized access attempt by {username} to check balance of {requested_user}.")
-                print("mdnkmn,mdndkndmndm,ndlmndm")
-                context = self._create_abortion_context(StatusCode.PERMISSION_DENIED, "Unauthorized balance access.")
-                return context
-
-        if "/PaymentGateway/ProcessPayment" in method:
-            logging.info(f"✅ {username} initiated a payment.")
-        
-        # Call the original RPC method if authorization is successful
+            self.tokens.verify(metadata.get("authorization"))
+        except TokenError as e:
+            log.warning("Rejected %s: %s", handler_call_details.method, e)
+            return _abort_handler(grpc.StatusCode.UNAUTHENTICATED, str(e))
         return continuation(handler_call_details)
-    
-    def _create_abortion_context(self, status_code, details):
-        """Helper method to create a context that aborts the call with given status code and details."""
-        class AbortionContext(grpc.ServicerContext):
-            def abort(self, code, details):
-                raise grpc.RpcError(code, details)
-            
-            def abort_with_status(self, status):
-                raise grpc.RpcError(status.code(), status.details())
-            
-            def is_active(self):
-                return False
-            
-            def time_remaining(self):
-                return None
-            
-            def cancel(self):
-                return False
-            
-            def add_callback(self, callback):
-                return False
-            
-            def invocation_metadata(self):
-                return None
-            
-            def peer(self):
-                return None
-            
-            def peer_identities(self):
-                return None
-            
-            def peer_identity_key(self):
-                return None
-            
-            def auth_context(self):
-                return None
-            
-            def set_compression(self, compression):
-                pass
-            
-            def send_initial_metadata(self, initial_metadata):
-                pass
-            
-            def set_trailing_metadata(self, trailing_metadata):
-                pass
-            
-            def disable_next_message_compression(self):
-                pass
-            
-            def get_code(self):
-                return status_code
-            
-            def get_details(self):
-                return details
-        
-        context = AbortionContext()
-        context.abort(status_code, details)
-        return context
+
+
+class PeerIdentityInterceptor(grpc.ServerInterceptor):
+    """Only lets callers whose mTLS certificate CN is in `allowed` through."""
+
+    def __init__(self, allowed):
+        self.allowed = set(allowed)
+
+    def intercept_service(self, continuation, handler_call_details):
+        allowed = self.allowed
+
+        def factory(behaviour):
+            def checked(request, context):
+                peer = peer_common_name(context)
+                if peer not in allowed:
+                    log.warning("Rejected %s from certificate %r", handler_call_details.method, peer)
+                    context.abort(grpc.StatusCode.PERMISSION_DENIED, "Caller certificate not authorised")
+                return behaviour(request, context)
+            return checked
+
+        return _wrap_unary(continuation(handler_call_details), factory)
+
 
 class LoggingInterceptor(grpc.ServerInterceptor):
-    def intercept_service(self, continuation, handler_call_details):
-        """Intercepts and logs all gRPC requests and responses."""
-        method = handler_call_details.method
-        metadata = dict(handler_call_details.invocation_metadata)
-        client_ip = metadata.get("x-real-ip", "Unknown")
-        
-        # Log the request
-        logging.info(f"✅ Request from {client_ip} - Method: {method}")
-        
-        try:
-            # Execute the original method
-            response = continuation(handler_call_details)
-            
-            # Log successful response
-            logging.info(f"✅ Success: {method} completed")
-            return response
-        except grpc.RpcError as e:
-            # Log error response
-            logging.error(f"❌ Error in {method}: {e.code()} - {e.details()}")
-            raise e
+    """Logs every call with its final status code and latency."""
 
-# Add detailed logging for transactions
-class TransactionLoggingInterceptor(grpc.ServerInterceptor):
     def intercept_service(self, continuation, handler_call_details):
-        """Specialized interceptor for detailed transaction logging."""
         method = handler_call_details.method
-        
-        if "ProcessPayment" in method:
-            metadata = dict(handler_call_details.invocation_metadata)
-            token = metadata.get("authorization")
-            username = "Unknown"
-            
-            # Try to extract username from JWT for better logs
-            if token:
+
+        def factory(behaviour):
+            def logged(request, context):
+                start = time.perf_counter()
                 try:
-                    decoded_token = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-                    username = decoded_token.get("username", "Unknown")
-                except:
-                    pass
-            
-            try:
-                # Execute the original method
-                response = continuation(handler_call_details)
-                
-                # Log successful transaction
-                logging.info(f"✅ Transaction processed successfully by {username} in {method}")
-                return response
-            except grpc.RpcError as e:
-                # Handle network errors with retry logging
-                if e.code() == grpc.StatusCode.UNAVAILABLE:
-                    logging.warning(f"🔄 Retrying {method} for {username} due to network failure")
-                
-                # Log transaction failure with details
-                logging.error(f"❌ Transaction failed for {username} in {method}: {e.code()} - {e.details()}")
-                raise e
-        else:
-            # For non-transaction methods, just pass through
-            return continuation(handler_call_details)
+                    return behaviour(request, context)
+                finally:
+                    code = context.code() or grpc.StatusCode.OK
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    log.info("%s %s %.1fms peer=%s", method, code.name, elapsed_ms, context.peer())
+            return logged
+
+        return _wrap_unary(continuation(handler_call_details), factory)

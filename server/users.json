@@ -1,30 +1,48 @@
 {
-    "users": [
-      {
-        "username": "alice",
-        "password": "alice123",
-        "bank_name": "HDFC",
-        "account_number": "1001"
-      },
-      {
-        "username": "alice",
-        "password": "alice123",
-        "bank_name": "SBI",
-        "account_number": "3001"
-      },
-      {
-        "username": "bob",
-        "password": "bob123",
-        "bank_name": "ICICI",
-        "account_number": "2001"
-      },
-      {
-        "username": "jack",
-        "password": "jack123",
-        "bank_name": "ICICI",
-        "account_number": "2002"
-      }
-
-    ]
-  }
-  
+  "users": [
+    {
+      "username": "alice",
+      "password_hash": "scrypt$16384$8$1$fdb1084ca5cb83d069077ba7e971aa11$96fc82ac7cb6f01484c27c5113d410d09d76651fa7ed98594b59d0f7af739483ed8145b72c8880f8933f552168619d458bf029ced33934920b998c4a74d6b64a",
+      "accounts": [
+        {
+          "bank_name": "HDFC",
+          "account_number": "1001"
+        },
+        {
+          "bank_name": "SBI",
+          "account_number": "3001"
+        }
+      ]
+    },
+    {
+      "username": "bob",
+      "password_hash": "scrypt$16384$8$1$4c6d5906d3347344e34d5b6f016c8f7e$9a845197f48caaee320d421d2e13415dcbcb7f46c8aca94864bdce6a2fb30b86494ef8e3de2f2fedbea625ffa3e6fa520086229ab353901a05c4886a35b66762",
+      "accounts": [
+        {
+          "bank_name": "ICICI",
+          "account_number": "2001"
+        }
+      ]
+    },
+    {
+      "username": "jack",
+      "password_hash": "scrypt$16384$8$1$b77d3f0249c4cad9f615d42729622445$d66d3db654decebb7ae4f9b071a3123c96b44ff5dfa0f7f98772be7995b123ef4824c0fc97efe509caadbb3ec9aac46f89dba9b0aa6ec81bdc6bb8837c3e817a",
+      "accounts": [
+        {
+          "bank_name": "ICICI",
+          "account_number": "2002"
+        }
+      ]
+    },
+    {
+      "username": "carol",
+      "password_hash": "scrypt$16384$8$1$f7772c331aa890fe4faaa2c74aaf4353$058b4a494d74632b5eb44c0c5daa2dd8997af9af23ab875f8c1e53de75ce0b0db61d656243721b6efd75eb1a29385ea0b6646c81eb52451624b7b171b20a18d0",
+      "accounts": [
+        {
+          "bank_name": "HDFC",
+          "account_number": "1002"
+        }
+      ]
+    }
+  ]
+}
