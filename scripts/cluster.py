@@ -21,7 +21,6 @@ from tls import secure_channel  # noqa: E402
 
 BANK_PORTS = {"HDFC": 61051, "ICICI": 61052, "SBI": 61053}
 GATEWAY_PORT = 51052
-JWT_SECRET = "cluster-demo-secret-not-for-production-use"
 IN_DOUBT = ("PREPARING", "COMMITTING", "ABORTING")
 
 
@@ -43,7 +42,6 @@ class Cluster:
             "PG_BANK_SEED_FILE": str(seed_file),
             "PG_GATEWAY_PORT": str(GATEWAY_PORT),
             "PG_GATEWAY_ADDRESS": f"localhost:{GATEWAY_PORT}",
-            "PG_JWT_SECRET": JWT_SECRET,
             "PG_PREPARE_TIMEOUT": str(prepare_timeout),
             "PG_RECOVERY_INTERVAL": str(recovery_interval),
             "PYTHONUNBUFFERED": "1",

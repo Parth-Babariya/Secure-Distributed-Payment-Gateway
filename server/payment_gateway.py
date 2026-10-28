@@ -28,6 +28,7 @@ import payment_gateway_pb2
 import payment_gateway_pb2_grpc
 from auth import LoginThrottle, TokenError, TokenManager, _DUMMY_HASH, load_users, verify_password
 from interceptor import AuthorizationInterceptor, LoggingInterceptor, PeerIdentityInterceptor
+from jwt_keys import KeyRing
 from storage import SQLiteStore
 from tls import peer_common_name, peer_host, secure_channel, server_credentials
 
@@ -503,7 +504,7 @@ class Gateway:
 
 
 def build_gateway(port=config.GATEWAY_PORT, *, cert_dir=None, data_dir=None, users=None,
-                  jwt_secret=config.JWT_SECRET, prepare_timeout=config.PREPARE_TIMEOUT_SECONDS,
+                  jwt_key_dir=None, prepare_timeout=config.PREPARE_TIMEOUT_SECONDS,
                   recovery_interval=config.RECOVERY_INTERVAL_SECONDS,
                   rpc_timeout=config.BANK_RPC_TIMEOUT_SECONDS, bind_host="[::]"):
     """Create a Gateway (not yet started)."""
@@ -514,7 +515,7 @@ def build_gateway(port=config.GATEWAY_PORT, *, cert_dir=None, data_dir=None, use
     coordinator_log = CoordinatorLog(data_dir / "gateway.db")
     banks = BankDirectory(coordinator_log, cert_dir)
     coordinator = Coordinator(coordinator_log, banks, rpc_timeout=rpc_timeout, prepare_timeout=prepare_timeout)
-    tokens = TokenManager(coordinator_log, secret=jwt_secret)
+    tokens = TokenManager(coordinator_log, KeyRing(jwt_key_dir or config.JWT_KEY_DIR or cert_dir / "jwt"))
     service = PaymentGatewayService(users if users is not None else load_users(), coordinator_log, banks,
                                     coordinator, tokens, LoginThrottle(coordinator_log))
 

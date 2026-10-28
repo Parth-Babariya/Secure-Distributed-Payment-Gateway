@@ -27,7 +27,6 @@ SEED = {
     "ICICI": {"2001": 400_000, "2002": 800_000},
     "SBI": {"3001": 650_000},
 }
-TEST_JWT_SECRET = "test-secret-for-the-in-process-harness-only"
 PASSWORDS = {"alice": "alice123", "bob": "bob123", "jack": "jack123", "carol": "carol123"}
 
 
@@ -36,7 +35,7 @@ class System:
         self.cert_dir = Path(cert_dir)
         self.data_dir = Path(data_dir)
         self.seed = seed
-        self.gateway_options = {"jwt_secret": TEST_JWT_SECRET, "recovery_interval": 0.2, **gateway_options}
+        self.gateway_options = {"recovery_interval": 0.2, **gateway_options}
         self.gateway = None
         self.gateway_port = 0
         self.banks = {}  # name -> (server, service, port, stop_event)

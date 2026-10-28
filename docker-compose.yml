@@ -5,13 +5,15 @@
 # The one-shot `certs` service creates the CA and writes each component's key
 # into a separate volume. Every runtime container mounts only its own volume,
 # which holds its key, its certificate and ca.crt. The CA's private key lives
-# in the `certs-ca` volume, which no runtime container mounts.
+# in the `certs-ca` volume, which no runtime container mounts. The session
+# token signing keys live in `jwt-keys`, mounted only by the gateway; rotate
+# them with
+#   docker compose run --rm -v <project>_jwt-keys:/keys certs #     python /app/scripts/rotate_jwt_key.py --dir /keys new
 x-common: &common
   build: .
   image: secure-payment-gateway
   environment: &env
     PG_GATEWAY_ADDRESS: gateway:50052
-    PG_JWT_SECRET: ${PG_JWT_SECRET:-change-me-to-a-long-random-secret-in-production}
   depends_on:
     certs:
       condition: service_completed_successfully
@@ -28,6 +30,7 @@ services:
       - certs-icici:/certs/icici
       - certs-sbi:/certs/sbi
       - certs-client:/certs/client
+      - jwt-keys:/certs/jwt
 
   gateway:
     <<: *common
@@ -36,7 +39,11 @@ services:
       - "50052:50052"
     volumes:
       - certs-gateway:/certs:ro
+      - jwt-keys:/jwt:ro
       - gateway-data:/data
+    environment:
+      <<: *env
+      PG_JWT_KEY_DIR: /jwt
 
   hdfc:
     <<: *common
@@ -87,6 +94,7 @@ volumes:
   certs-icici:
   certs-sbi:
   certs-client:
+  jwt-keys:
   gateway-data:
   hdfc-data:
   icici-data:

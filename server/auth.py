@@ -106,29 +106,40 @@ class TokenError(Exception):
 
 
 class TokenManager:
-    """Issues HS256 JWTs and checks them against a revocation store."""
+    """Issues EdDSA (Ed25519) JWTs and checks them against a revocation store.
 
-    def __init__(self, revocations, secret=None, ttl_seconds=config.TOKEN_TTL_SECONDS):
-        if not secret:
-            log.warning("PG_JWT_SECRET is not set; using a random per-process secret")
-            secret = secrets.token_urlsafe(32)
-        if len(secret) < 32:
-            raise ValueError("PG_JWT_SECRET must be at least 32 characters")
-        self.secret = secret
+    Each token names its signing key in the `kid` header, so keys can be
+    rotated while tokens signed with the previous key stay valid until they
+    expire (see jwt_keys.py).
+    """
+
+    ALGORITHM = "EdDSA"
+
+    def __init__(self, revocations, keys, ttl_seconds=config.TOKEN_TTL_SECONDS):
+        self.keys = keys
         self.ttl = ttl_seconds
         self.revocations = revocations
 
     def issue(self, username):
         now = int(time.time())
-        payload = {"sub": username, "jti": uuid.uuid4().hex, "iat": now, "exp": now + self.ttl}
-        return jwt.encode(payload, self.secret, algorithm="HS256")
+        kid, key = self.keys.signing_key()
+        payload = {"iss": config.TOKEN_ISSUER, "sub": username, "jti": uuid.uuid4().hex,
+                   "iat": now, "exp": now + self.ttl}
+        return jwt.encode(payload, key, algorithm=self.ALGORITHM, headers={"kid": kid})
 
     def verify(self, token):
         """Return the token's claims or raise TokenError."""
         if not token:
             raise TokenError("Missing authentication token")
         try:
-            claims = jwt.decode(token, self.secret, algorithms=["HS256"], options={"require": ["sub", "jti", "exp"]})
+            kid = jwt.get_unverified_header(token).get("kid")
+            key = self.keys.public_key(kid) if isinstance(kid, str) else None
+            if key is None:
+                raise TokenError("Token signed with an unknown key")
+            # Only EdDSA is accepted, whatever the header claims, so an
+            # HS256 token "signed" with the public key is refused.
+            claims = jwt.decode(token, key, algorithms=[self.ALGORITHM], issuer=config.TOKEN_ISSUER,
+                                options={"require": ["iss", "sub", "jti", "exp"]})
         except jwt.ExpiredSignatureError:
             raise TokenError("Token expired")
         except jwt.InvalidTokenError:

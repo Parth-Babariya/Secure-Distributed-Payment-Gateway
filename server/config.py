@@ -28,9 +28,11 @@ def bank_cn(bank_name):
     return f"{bank_name.lower()}.bank"
 
 
-# JWT secret: set PG_JWT_SECRET in any real deployment. Without it a random
-# per-process secret is used, so tokens do not survive a gateway restart.
-JWT_SECRET = os.environ.get("PG_JWT_SECRET")
+# Ed25519 keys that sign session tokens (see jwt_keys.py). Defaults to
+# <cert dir>/jwt, which scripts/gen_certs.py creates. Without a key a random
+# in-memory one is used, so tokens do not survive a gateway restart.
+JWT_KEY_DIR = Path(os.environ["PG_JWT_KEY_DIR"]) if os.environ.get("PG_JWT_KEY_DIR") else None
+TOKEN_ISSUER = "secure-payment-gateway"
 TOKEN_TTL_SECONDS = int(os.environ.get("PG_TOKEN_TTL_SECONDS", "900"))
 
 # Login throttling: failures allowed within the window per (username, client

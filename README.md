@@ -69,7 +69,8 @@ PREPARING --both banks vote yes--> COMMITTING --both acknowledge--> COMMITTED
 | Stolen password database | Passwords are stored as salted scrypt hashes and compared in constant time; logins for unknown users take the same time |
 | Password guessing | 5 failures in 5 minutes per (username, client address), and 20 per client address across all usernames, lock further attempts for 60 s. Attempts are counted per address, so an attacker cannot lock the real user out from elsewhere; the counts are stored, so a restart does not reset them |
 | Token theft after logout | Each JWT has a `jti` that logout revokes; the revocation list is persisted, so it survives restarts |
-| Weak or hard-coded JWT secret | Read from `PG_JWT_SECRET`, at least 32 characters; a random per-process secret is used if it is unset |
+| Forged or replayed session tokens | Tokens are EdDSA (Ed25519) JWTs; only the gateway holds the private key, and anything that only verifies needs just the public key. Only `EdDSA` is accepted, so `alg: none` and HS256 tokens "signed" with the public key are refused |
+| A long-lived signing key | Keys rotate without logging anyone out: each token names its key (`kid`), a new key starts signing at once, and the old key keeps verifying until its tokens expire (`scripts/rotate_jwt_key.py`). In Docker the keys live in a volume only the gateway mounts |
 | Reusing another user's transaction id | Idempotency is bound to the user and the payment parameters; a mismatch returns `ALREADY_EXISTS` |
 
 ## Quick start
@@ -97,6 +98,14 @@ python bank_server.py SBI 60053    # terminal 4
 python ../client/client.py         # terminal 5
 ```
 
+Session tokens are signed with an Ed25519 key that `gen_certs.py` puts in `certs/jwt/`. To rotate it:
+
+```sh
+python scripts/rotate_jwt_key.py new             # new key signs from now on
+python scripts/rotate_jwt_key.py list
+python scripts/rotate_jwt_key.py retire <old-kid>  # after one token lifetime: verify-only
+```
+
 Demo users (passwords are stored hashed in [server/users.json](server/users.json); add users with `scripts/hash_password.py`):
 
 | User | Password | Accounts |
@@ -113,7 +122,7 @@ Opening balances come from [server/bank_data.json](server/bank_data.json) the fi
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PG_JWT_SECRET` | random per process | HS256 signing key (≥ 32 chars) |
+| `PG_JWT_KEY_DIR` | `certs/jwt/` | Ed25519 token signing keys (created by `gen_certs.py`; an in-memory key is used if empty) |
 | `PG_CERT_DIR` / `PG_DATA_DIR` | `certs/` / `data/` | Certificate and database locations |
 | `PG_GATEWAY_ADDRESS` | `localhost:50052` | Where banks and clients find the gateway |
 | `PG_BANK_HOST` | `localhost` | Host name a bank registers itself under |
@@ -178,14 +187,14 @@ Each payment makes three durable writes at the gateway and two at each bank. Wit
 
 - **The coordinator is a single point of failure.** 2PC is a blocking protocol: while the gateway is down, prepared reservations stay held until it recovers, which is safe but not available. Running the coordinator log on a replicated store (Raft or Paxos) would remove this; it is what systems like Spanner do.
 - **One SQLite connection per process** serialises writes. A production system would use PostgreSQL and group commit.
-- **Users live in a JSON file**, and the JWT uses a single shared HS256 key. A real deployment would use a user database and asymmetric keys (RS256 or EdDSA) with rotation.
+- **Users live in a JSON file.** A real deployment would use a user database, and keep token signing keys in a KMS or HSM rather than on disk.
 
 ## Repository layout
 
 ```
 protofiles/   gRPC service definitions (.proto) and generated code
-server/       payment_gateway.py, bank_server.py, auth.py, interceptor.py, storage.py, tls.py, config.py
+server/       payment_gateway.py, bank_server.py, auth.py, jwt_keys.py, interceptor.py, storage.py, tls.py, config.py
 client/       client.py
-scripts/      gen_certs.py, hash_password.py, chaos_demo.py, benchmark.py, cluster.py
+scripts/      gen_certs.py, rotate_jwt_key.py, hash_password.py, chaos_demo.py, benchmark.py, cluster.py
 tests/        pytest suite and in-process harness
 ```

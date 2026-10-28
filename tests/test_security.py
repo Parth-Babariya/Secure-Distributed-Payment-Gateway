@@ -2,8 +2,10 @@ import time
 
 import grpc
 import jwt
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from harness import TEST_JWT_SECRET, expect_code
+import config
+from harness import expect_code
 import bank_pb2
 import payment_gateway_pb2 as pg
 
@@ -15,13 +17,14 @@ def test_calls_without_a_valid_token_are_unauthenticated(system):
     expect_code(grpc.StatusCode.UNAUTHENTICATED, stub.CheckBalance, request,
                 metadata=[("authorization", "not-a-jwt")])
 
-    forged = jwt.encode({"sub": "alice", "jti": "x", "exp": int(time.time()) + 60}, "wrong-secret-that-is-also-long-enough",
-                        algorithm="HS256")
+    kid, key = system.gateway.service.tokens.keys.signing_key()
+    claims = {"iss": config.TOKEN_ISSUER, "sub": "alice", "jti": "x", "exp": int(time.time()) + 60}
+    # Right key id, wrong private key.
+    forged = jwt.encode(claims, Ed25519PrivateKey.generate(), algorithm="EdDSA", headers={"kid": kid})
     expect_code(grpc.StatusCode.UNAUTHENTICATED, stub.CheckBalance, request,
                 metadata=[("authorization", forged)])
 
-    expired = jwt.encode({"sub": "alice", "jti": "y", "exp": int(time.time()) - 5}, TEST_JWT_SECRET,
-                         algorithm="HS256")
+    expired = jwt.encode({**claims, "exp": int(time.time()) - 5}, key, algorithm="EdDSA", headers={"kid": kid})
     error = expect_code(grpc.StatusCode.UNAUTHENTICATED, stub.CheckBalance, request,
                         metadata=[("authorization", expired)])
     assert "expired" in error.details().lower()

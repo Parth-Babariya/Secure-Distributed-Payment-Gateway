@@ -1,7 +1,8 @@
 """Generate a local CA and mTLS certificates for every component.
 
 Certificates are never committed: run this once after cloning (or let Docker
-Compose and the test suite run it). Usage:
+Compose and the test suite run it). It also creates the first session-token
+signing key in <out>/jwt/ (see scripts/rotate_jwt_key.py). Usage:
 
     python scripts/gen_certs.py [--out certs] [--banks HDFC ICICI SBI] [--force] [--split]
 """
@@ -17,6 +18,10 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "server"))
+
+import jwt_keys  # noqa: E402
+
 DEFAULT_BANKS = ["HDFC", "ICICI", "SBI"]
 VALIDITY = datetime.timedelta(days=365)
 
@@ -93,6 +98,12 @@ def make_leaf(ca_key, ca_cert, common_name, dns_names):
     return key, cert
 
 
+def ensure_jwt_key(directory):
+    """Create a token signing key unless the directory already has one."""
+    if not any(state == "signing" for _, state in jwt_keys.list_keys(directory)):
+        print(f"Created JWT signing key {jwt_keys.generate_key(directory)} in {directory}")
+
+
 def generate(out_dir, banks=DEFAULT_BANKS, force=False, split=False):
     """Write the CA and one certificate per component.
 
@@ -102,6 +113,7 @@ def generate(out_dir, banks=DEFAULT_BANKS, force=False, split=False):
     deployment can give each process access to nothing but its own key.
     """
     out_dir = Path(out_dir)
+    ensure_jwt_key(out_dir / "jwt")
     ca_dir = out_dir / "ca" if split else out_dir
     ca_dir.mkdir(parents=True, exist_ok=True)
     if (ca_dir / "ca.crt").exists() and not force:
