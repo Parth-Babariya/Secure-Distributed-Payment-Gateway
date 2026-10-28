@@ -8,7 +8,7 @@
 # in the `certs-ca` volume, which no runtime container mounts. The session
 # token signing keys live in `jwt-keys`, mounted only by the gateway; rotate
 # them with
-#   docker compose run --rm -v <project>_jwt-keys:/keys certs #     python /app/scripts/rotate_jwt_key.py --dir /keys new
+#   docker compose run --rm --no-deps certs python /app/scripts/rotate_jwt_key.py --dir /certs/jwt new
 x-common: &common
   build: .
   image: secure-payment-gateway
