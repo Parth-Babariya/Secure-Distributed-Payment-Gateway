@@ -211,6 +211,11 @@ class Coordinator:
         self.banks = banks
         self.rpc_timeout = rpc_timeout
         self.prepare_timeout = prepare_timeout
+        # Both participants are asked to prepare at the same time.
+        self._prepare_pool = futures.ThreadPoolExecutor(max_workers=64, thread_name_prefix="prepare")
+
+    def close(self):
+        self._prepare_pool.shutdown(wait=False)
 
     @staticmethod
     def _participants(row):
@@ -266,8 +271,12 @@ class Coordinator:
     def execute(self, row):
         """Run both phases for a freshly logged PREPARING payment."""
         txn_id = row["transaction_id"]
-        for bank, operation, account in self._participants(row):
-            vote, message = self._prepare(row, bank, operation, account)
+        participants = self._participants(row)
+        pending = [self._prepare_pool.submit(self._prepare, row, bank, operation, account)
+                   for bank, operation, account in participants]
+        votes = [future.result() for future in pending]
+        # Report the sender's reason first (e.g. insufficient funds).
+        for (bank, _, _), (vote, message) in zip(participants, votes):
             if not vote:
                 log.info("[%s] %s voted NO: %s", txn_id, bank, message)
                 self.log.transition(txn_id, [PREPARING], ABORTING, message)
@@ -488,6 +497,7 @@ class Gateway:
         self.recovery.stop()
         self.server.stop(grace).wait()
         self.recovery.join(timeout=5)
+        self.service.coordinator.close()
         self.service.banks.close()
         self.service.log.close()
 
