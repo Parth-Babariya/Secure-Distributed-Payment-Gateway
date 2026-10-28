@@ -7,7 +7,11 @@ Checks, after recovery:
   * atomicity: for every payment both banks agree with the gateway's outcome
     (COMMITTED at both, or committed at neither).
 
-Usage: python scripts/chaos_demo.py [--seconds 60] [--workers 8] [--seed 1]
+With --replicated the coordinator log is a three-node etcd (Raft) cluster
+shared by three gateways, and etcd nodes are killed too. One component is
+down at a time, so etcd always keeps its majority.
+
+Usage: python scripts/chaos_demo.py [--seconds 60] [--workers 8] [--seed 1] [--replicated]
 """
 import argparse
 import random
@@ -84,12 +88,14 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--keep", action="store_true", help="keep the working directory")
+    parser.add_argument("--replicated", action="store_true",
+                        help="three gateways sharing a three-node etcd log (needs scripts/get_etcd.py)")
     args = parser.parse_args(argv)
 
     work_dir = Path(tempfile.mkdtemp(prefix="pg-chaos-"))
     seed_paise = {b: {a: r * 100 for a, r in accts.items()} for b, accts in SEED.items()}
     opening_total = sum(sum(a.values()) for a in seed_paise.values())
-    cluster = Cluster(work_dir, SEED)
+    cluster = Cluster(work_dir, SEED, replicated=args.replicated)
     rng = random.Random(args.seed)
     results = Counter()
     kills = Counter()
@@ -107,7 +113,7 @@ def main(argv=None):
         deadline = time.time() + args.seconds
         while time.time() < deadline:
             time.sleep(rng.uniform(1.0, 3.0))
-            victim = rng.choice(["GATEWAY", *BANK_PORTS])
+            victim = rng.choice(cluster.gateways + cluster.banks + cluster.etcd_nodes)
             cluster.kill(victim)
             kills[victim] += 1
             time.sleep(rng.uniform(0.2, 1.5))
@@ -123,9 +129,8 @@ def main(argv=None):
             if not any(p[4] in IN_DOUBT for p in cluster.payments()):
                 break
             time.sleep(0.5)
-        cluster.stop_all()
-
         payments, total, problems = audit(cluster, opening_total)
+        cluster.stop_all()
         statuses = Counter(p[4] for p in payments)
         print()
         print(f"Kills:            {dict(kills)} ({sum(kills.values())} total)")

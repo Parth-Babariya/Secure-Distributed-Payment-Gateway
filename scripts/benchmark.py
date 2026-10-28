@@ -3,6 +3,7 @@ separate processes, mTLS everywhere, every 2PC step fsynced).
 
 Usage: python scripts/benchmark.py [--concurrency 1 4 16 32] [--seconds 10]
        python scripts/benchmark.py --ab PG_GROUP_COMMIT 0 1 [--rounds 3]
+       python scripts/benchmark.py --replicated   # 3 gateways on a 3-node etcd log
 
 --ab runs alternating rounds with an environment variable set to each value
 and reports the median of each level, which is far more reliable than two
@@ -85,11 +86,11 @@ def format_row(r):
             f"{r['p50_ms']:>7.1f} {r['p95_ms']:>7.1f} {r['p99_ms']:>7.1f}")
 
 
-def run_cluster(levels, seconds, extra_env=None, on_result=None):
+def run_cluster(levels, seconds, extra_env=None, on_result=None, replicated=False):
     """Start a fresh cluster, run every level, and return the results."""
     work_dir = Path(tempfile.mkdtemp(prefix="pg-bench-"))
     cluster = Cluster(work_dir, {b: {a: p / 100 for a, p in accts.items()} for b, accts in SEED.items()},
-                      extra_env=extra_env)
+                      extra_env=extra_env, replicated=replicated)
     results = []
     try:
         cluster.start_all()
@@ -113,11 +114,14 @@ def main(argv=None):
     parser.add_argument("--ab", nargs=3, metavar=("VAR", "A", "B"),
                         help="compare two values of an environment variable")
     parser.add_argument("--rounds", type=int, default=3, help="rounds per value with --ab")
+    parser.add_argument("--replicated", action="store_true",
+                        help="three gateways sharing a three-node etcd log (needs scripts/get_etcd.py)")
     args = parser.parse_args(argv)
 
     if not args.ab:
         print(HEADER)
-        run_cluster(args.concurrency, args.seconds, on_result=lambda r: print(format_row(r), flush=True))
+        run_cluster(args.concurrency, args.seconds, on_result=lambda r: print(format_row(r), flush=True),
+                    replicated=args.replicated)
         return
 
     var, *values = args.ab
@@ -125,7 +129,8 @@ def main(argv=None):
     for round_no in range(1, args.rounds + 1):
         for value in values:
             print(f"round {round_no}/{args.rounds}: {var}={value}", flush=True)
-            runs[value].append(run_cluster(args.concurrency, args.seconds, extra_env={var: value}))
+            runs[value].append(run_cluster(args.concurrency, args.seconds, extra_env={var: value},
+                                           replicated=args.replicated))
     for value in values:
         print(f"\n{var}={value} (median of {args.rounds} rounds)")
         print(HEADER)

@@ -19,9 +19,13 @@ jobs:
         run: |
           python -m grpc_tools.protoc -Iprotofiles --python_out=protofiles --grpc_python_out=protofiles protofiles/bank.proto protofiles/payment_gateway.proto
           git diff --exit-code protofiles
-      - run: pytest -q
+      - name: Install etcd (checksum-verified) for the replicated coordinator tests
+        run: python scripts/get_etcd.py
+      - run: pytest -q -rs
       - name: Chaos demo (processes killed mid-payment, then audited)
         run: python scripts/chaos_demo.py --seconds 30
+      - name: Chaos demo, replicated (3 gateways on a 3-node etcd log; gateways and etcd nodes killed)
+        run: python scripts/chaos_demo.py --seconds 30 --replicated
 
   docker:
     runs-on: ubuntu-latest
